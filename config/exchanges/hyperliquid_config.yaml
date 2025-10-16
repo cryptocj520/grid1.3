@@ -1,0 +1,313 @@
+# ====================================
+# Hyperliquid交易所配置文件
+# ====================================
+# 本配置文件用于配置Hyperliquid交易所的各项参数
+# 包括API连接、认证信息、市场配置、WebSocket设置等
+
+hyperliquid:
+  # API连接配置
+  api:
+    base_url: https://api.hyperliquid.xyz  # REST API基础URL
+    timeout: 30                           # API请求超时时间(秒)
+    version: v1                           # API版本
+    ws_url: wss://api.hyperliquid.xyz/ws  # WebSocket URL
+    
+  # 认证配置 - 用于私有API调用
+  # 💡 说明：Hyperliquid使用钱包签名认证，只需要2个字段
+  authentication:
+    private_key: '---------'                      # 🔑 钱包私钥(用于签名认证) - 必填
+    wallet_address: '------------'                   # 📍 钱包地址 - 必填
+  # 自定义订阅配置 - 定义预设的订阅组合
+  custom_subscriptions:
+    # 当前激活的订阅组合
+    active_combination: major_coins
+    
+    # 预定义的订阅组合
+    combinations:
+      # 完整数据组合
+      full_data:
+        data_types:
+          orderbook: false    # 订单簿数据
+          ticker: true        # 价格数据 (推荐)
+          trades: false       # 交易数据
+          user_data: false    # 用户数据
+        description: 🔥 永续合约价格数据订阅
+        symbols:
+        - BTC/USDC:PERP
+        - ETH/USDC:PERP
+        
+      # 主流币种组合 (当前活跃)
+      major_coins:
+        data_types:
+          orderbook: false    # 订单簿数据
+          ticker: true        # 价格数据 (推荐)
+          trades: false       # 交易数据
+        description: 🔥 主流币种永续合约价格数据订阅
+        symbols:
+        - BTC/USDC:PERP
+        - ETH/USDC:PERP
+        - SOL/USDC:PERP
+        
+      # 仅价格数据组合
+      price_only:
+        data_types:
+          orderbook: false    # 订单簿数据
+          ticker: true        # 价格数据 (推荐)
+          trades: false       # 交易数据
+        description: 🔥 永续合约价格数据订阅
+        symbols:
+        - BTC/USDC:PERP
+        - ETH/USDC:PERP
+        - SOL/USDC:PERP
+        - AVAX/USDC:PERP
+        - DOGE/USDC:PERP
+        
+    # 自定义订阅配置
+    custom:
+      data_types:
+        orderbook: false    # 订单簿数据
+        ticker: true        # 价格数据 (推荐)
+        trades: false
+        user_data: false
+      symbols: []
+  development:
+    debug: false
+    mock_data: false
+    sandbox: false
+  enabled: true
+  error_handling:
+    max_retries: 3
+    retry_backoff: 2
+    retry_delay: 1
+  exchange_id: hyperliquid
+  fees:
+    perpetual:
+      funding: 0.0001
+      maker: 0.0002
+      taker: 0.0005
+    spot:
+      maker: 0.0
+      taker: 0.001
+  health_check:
+    enabled: true
+    interval: 60
+    timeout: 10
+  logging:
+    format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level: INFO
+  market_data:
+    orderbook_limit: 100
+    ticker_interval: 1000
+    trade_history_limit: 500
+  # 市场类型配置 - 定义支持的市场类型
+  market_types:
+    # 默认市场类型 (优先选择)
+    default_market: perpetual
+    
+    # 永续合约市场配置
+    perpetual:
+      description: 永续合约市场     # 市场描述
+      enabled: true              # 是否启用 (true=启用, false=禁用)
+      suffix: :PERP             # 符号后缀 (已弃用，现在统一使用:USDC)
+      
+    # 市场优先级 (优先处理哪种市场)
+    priority: perpetual
+    
+    # 现货市场配置
+    spot:
+      description: 现货市场        # 市场描述
+      enabled: false             # 是否启用 (建议关闭以减少数据量)
+      suffix: :SPOT             # 符号后缀 (已弃用，现在统一使用:USDC)
+  name: Hyperliquid
+  # 精度配置 - 定义价格和数量的小数位数
+  precision:
+    # 价格精度 (小数位数)
+    price:
+      ADA/USDC:PERP: 6          # ADA永续合约价格6位小数
+      AVAX/USDC:PERP: 4         # AVAX永续合约价格4位小数
+      AVAX/USDC:SPOT: 4         # AVAX现货价格4位小数
+      BTC/USDC:PERP: 2          # BTC永续合约价格2位小数
+      BTC/USDC:SPOT: 2          # BTC现货价格2位小数
+      DOGE/USDC:PERP: 6         # DOGE永续合约价格6位小数
+      ETH/USDC:PERP: 2          # ETH永续合约价格2位小数
+      ETH/USDC:SPOT: 2          # ETH现货价格2位小数
+      LINK/USDC:PERP: 4         # LINK永续合约价格4位小数
+      SOL/USDC:PERP: 4          # SOL永续合约价格4位小数
+      SOL/USDC:SPOT: 4          # SOL现货价格4位小数
+      UNI/USDC:PERP: 4          # UNI永续合约价格4位小数
+      default: 6                # 默认价格精度
+      
+    # 数量精度 (小数位数)
+    quantity:
+      ADA/USDC:PERP: 0          # ADA永续合约数量0位小数
+      AVAX/USDC:PERP: 3         # AVAX永续合约数量3位小数
+      AVAX/USDC:SPOT: 3         # AVAX现货数量3位小数
+      BTC/USDC:PERP: 5          # BTC永续合约数量5位小数
+      BTC/USDC:SPOT: 5          # BTC现货数量5位小数
+      DOGE/USDC:PERP: 0         # DOGE永续合约数量0位小数
+      ETH/USDC:PERP: 4          # ETH永续合约数量4位小数
+      ETH/USDC:SPOT: 4          # ETH现货数量4位小数
+      LINK/USDC:PERP: 2         # LINK永续合约数量2位小数
+      SOL/USDC:PERP: 3          # SOL永续合约数量3位小数
+      SOL/USDC:SPOT: 3          # SOL现货数量3位小数
+      UNI/USDC:PERP: 2          # UNI永续合约数量2位小数
+      default: 6                # 默认数量精度
+      
+  # 速率限制配置 - 防止API调用过于频繁
+  rate_limits:
+    order_cancellation: 50      # 订单取消速率限制 (每分钟)
+    order_creation: 20          # 订单创建速率限制 (每分钟)
+    rest_api: 100              # REST API速率限制 (每分钟)
+    websocket: 10              # WebSocket连接速率限制 (每分钟)
+  # 订阅模式配置 - 控制如何发现和订阅交易对
+  subscription_mode:
+    # 订阅模式: "dynamic" 或 "predefined"
+    mode: dynamic
+    
+    # 动态订阅配置 - 自动发现交易对
+    dynamic:
+      # 数据类型配置
+      data_types:
+        orderbook: false       # 订单簿数据
+        ticker: true          # 价格数据 (推荐)
+        trades: false         # 交易数据
+        user_data: false      # 用户数据
+        
+      # 交易对发现配置
+      discovery:
+        enabled: true         # 是否启用自动发现
+        filter_criteria:
+          # 排除模式 (符合以下模式的交易对将被排除)
+          exclude_patterns:
+          - '*SPOT*'         # 排除现货交易对
+          - '*TEST*'         # 排除测试交易对
+          exclude_symbols: []  # 排除特定交易对
+          
+          # 包含模式 (只包含符合以下模式的交易对)
+          include_patterns:
+          - '*/USDC:USDC'    # 只包含USDC计价的交易对
+          
+          # 市场类型过滤
+          market_types:
+          - perpetual        # 只包含永续合约
+          
+          max_symbols: 1000   # 最大交易对数量
+          volume_threshold: 1000000  # 最小交易量阈值
+          
+      # 动态订阅配置
+      dynamic_subscription:
+        auto_discovery_interval: 300  # 自动发现间隔(秒)
+        max_retry_attempts: 3         # 最大重试次数
+        retry_delay: 5               # 重试延迟(秒)
+    
+    # 预定义订阅配置 - 使用固定的交易对列表
+    predefined:
+      # 批量订阅配置
+      batch_subscription:
+        batch_size: 10              # 批量大小
+        delay_between_batches: 1    # 批次间延迟(秒)
+        enabled: true               # 是否启用批量订阅
+        
+      # 数据类型配置
+      data_types:
+        orderbook: false           # 订单簿数据
+        ticker: true              # 价格数据 (推荐)
+        trades: false             # 交易数据
+        user_data: false          # 用户数据
+        
+      # 预定义交易对列表
+      symbols:
+      - BTC/USDC:USDC
+      - ETH/USDC:USDC
+      - SOL/USDC:USDC
+      - AVAX/USDC:USDC
+      - DOGE/USDC:USDC
+      - BTC/USDC:USDC
+      - ETH/USDC:USDC
+      - SOL/USDC:USDC
+  # 符号映射配置已移除 - 现在由执行器统一处理格式转换
+  
+  # 支持的交易对配置
+  symbols:
+    # 永续合约交易对 - 🔥 修复：统一使用:USDC格式
+    perpetual:
+    - BTC/USDC:USDC           # BTC永续合约
+    - ETH/USDC:USDC           # ETH永续合约
+    - SOL/USDC:USDC           # SOL永续合约
+    - AVAX/USDC:USDC          # AVAX永续合约
+    - DOGE/USDC:USDC          # DOGE永续合约
+    - ADA/USDC:USDC           # ADA永续合约
+    - LINK/USDC:USDC          # LINK永续合约
+    - UNI/USDC:USDC           # UNI永续合约
+    - AAVE/USDC:USDC          # AAVE永续合约
+    - MATIC/USDC:USDC         # MATIC永续合约
+    - DOT/USDC:USDC           # DOT永续合约
+    - ATOM/USDC:USDC          # ATOM永续合约
+    
+    # 现货交易对 - 🔥 修复：统一使用:USDC格式
+    spot:
+    - BTC/USDC:USDC           # BTC现货
+    - ETH/USDC:USDC           # ETH现货
+    - SOL/USDC:USDC           # SOL现货
+    - AVAX/USDC:USDC          # AVAX现货
+    - DOGE/USDC:SPOT
+    - ADA/USDC:SPOT
+    - LINK/USDC:SPOT
+    - UNI/USDC:SPOT
+  trading:
+    perpetual:
+      default_leverage: 10
+      margin_mode: cross
+      max_leverage: 50
+      max_order_size: 10000
+      min_order_size: 0.001
+    spot:
+      default_leverage: 1
+      margin_mode: cash
+      max_leverage: 1
+      max_order_size: 10000
+      min_order_size: 0.001
+  # WebSocket配置 - 控制实时数据订阅行为
+  websocket:
+    # 是否启用WebSocket订阅
+    enabled: true
+    
+    # 🔄 WebSocket实现模式切换 - 核心配置参数
+    # 可选值:
+    #   - "native": 原生WebSocket实现 (推荐)
+    #     ✅ 零延迟，高性能
+    #     ✅ 直接连接Hyperliquid原生API
+    #     ✅ 专门优化的实现
+    #     ✅ 处理原生数据格式
+    #   - "ccxt": CCXT WebSocket实现
+    #     ✅ 成熟稳定的ccxt库支持
+    #     ✅ 标准化接口
+    #     ✅ 更好的兼容性
+    #     ✅ 丰富的功能支持
+    # 切换方法:
+    #   1. 使用脚本: python3 switch_hyperliquid_websocket.py [native|ccxt]
+    #   2. 手动修改: 直接改变下面的值
+    #   3. 重启监控程序使配置生效
+    implementation: native
+    
+    # 连接管理配置
+    auto_reconnect: true          # 是否自动重连
+    max_reconnect_attempts: 5     # 最大重连尝试次数
+    reconnect_delay: 5           # 重连延迟(秒)
+    ping_interval: 30            # 心跳间隔(秒)
+    
+    # 订阅配置 - 控制订阅哪些数据类型
+    subscriptions:
+      # 永续合约订阅
+      perpetual:
+        activeAssetCtx: true     # 活跃资产上下文 (用于获取市场信息)
+        allMids: true           # 所有中间价 (ticker数据)
+        l2Book: true           # L2订单簿深度数据
+        trades: false          # 交易数据 (暂时关闭以减少数据量)
+      
+      # 现货合约订阅
+      spot:
+        activeAssetCtx: false   # 现货暂时不订阅活跃资产上下文
+        allMids: true          # 现货中间价数据
+        l2Book: true          # 现货L2订单簿
+        trades: false         # 现货交易数据

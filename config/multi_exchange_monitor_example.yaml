@@ -1,0 +1,96 @@
+# 多交易所价格监控配置示例
+# Multi-Exchange Price Monitor Configuration Example
+# 
+# 使用说明:
+# 1. 复制此文件为 multi_exchange_monitor.yaml
+# 2. 填入你的API密钥
+# 3. 根据需要调整监控符号
+# 4. 运行 python run_multi_exchange_monitor.py
+
+# 交易所配置
+exchanges:
+  # Hyperliquid (永续合约)
+  hyperliquid:
+    enabled: true
+    api_key: ""        # 填入你的API密钥
+    api_secret: ""     # 填入你的API密码
+    testnet: false     # 是否使用测试网
+    
+  # Binance (现货和合约)
+  binance:
+    enabled: true
+    api_key: ""        # 填入你的API密钥
+    api_secret: ""     # 填入你的API密码
+    testnet: false     # 是否使用测试网
+    
+  # OKX (现货和合约)
+  okx:
+    enabled: true
+    api_key: ""        # 填入你的API密钥
+    api_secret: ""     # 填入你的API密码
+    passphrase: ""     # 填入你的密语 (OKX特有)
+    testnet: false     # 是否使用测试网
+
+# 监控符号配置 (标准格式: BASE/QUOTE)
+symbols:
+  # 现货交易对
+  spot:
+    - "BTC/USDT"      # 比特币
+    - "ETH/USDT"      # 以太坊
+    - "SOL/USDT"      # Solana
+    - "BNB/USDT"      # Binance Coin
+    
+  # 永续合约
+  perpetual:
+    - "BTC/USDT"      # 比特币永续
+    - "ETH/USDT"      # 以太坊永续
+    - "SOL/USDT"      # Solana永续
+    - "AVAX/USDT"     # Avalanche永续
+
+# 界面显示配置
+display:
+  # 刷新间隔 (秒)
+  refresh_interval: 1.0
+  
+  # 价差阈值配置 (百分比)
+  price_difference_threshold:
+    warning: 0.1      # 0.1% 显示黄色警告
+    critical: 0.5     # 0.5% 显示红色重要
+    
+  # 表格显示设置
+  table:
+    show_timestamp: true   # 显示更新时间
+    show_volume: false     # 显示成交量
+    precision: 4           # 价格显示精度
+    
+  # 颜色主题
+  colors:
+    normal: "white"        # 正常价格
+    warning: "yellow"      # 警告阈值
+    critical: "red"        # 重要阈值
+    unavailable: "dim"     # 不可用数据
+
+# WebSocket连接配置
+websocket:
+  connection_timeout: 10   # 连接超时 (秒)
+  
+  # 重连设置
+  reconnect:
+    max_attempts: 5        # 最大重试次数
+    delay: 5              # 重连延迟 (秒)
+    
+  # 心跳设置
+  heartbeat_interval: 30   # 心跳间隔 (秒)
+
+# 日志配置
+logging:
+  level: "INFO"                              # 日志级别
+  file: "logs/multi_exchange_monitor.log"    # 日志文件
+  console: true                              # 控制台输出
+  
+# 数据管理配置
+data:
+  price_cache_ttl: 60              # 价格缓存时间 (秒)
+  max_spread_records: 1000         # 最大价差记录数
+  save_spread_history: true        # 保存价差历史
+  history_file: "logs/spread_history.csv"   # 历史文件路径

@@ -1,0 +1,242 @@
+edgex:
+  # 基础配置 - EdgeX专注永续合约
+  name: "EdgeX"
+  exchange_id: "edgex"
+  enabled: true  # 🔥 启用EdgeX交易所
+  type: "perpetual"  # EdgeX只有永续合约
+  
+  # 📡 订阅模式配置 - 支持硬编码和动态两种模式
+  subscription_mode:
+    # 订阅模式选择
+    # "predefined" - 硬编码模式：使用配置文件中预定义的交易对
+    # "dynamic" - 动态模式：从市场获取交易对后订阅
+    mode: "dynamic"  # 🔥 使用动态模式从市场获取交易对
+    
+    # 硬编码模式配置
+    predefined:
+      # 要订阅的交易对列表（EdgeX永续合约）
+      symbols:
+        - "BTC_USDT_PERP"
+        - "ETH_USDT_PERP"
+        - "SOL_USDT_PERP"
+        - "AVAX_USDT_PERP"
+        - "DOGE_USDT_PERP"
+        - "ADA_USDT_PERP"
+        - "MATIC_USDT_PERP"
+        - "DOT_USDT_PERP"
+        - "LINK_USDT_PERP"
+        - "UNI_USDT_PERP"
+        
+      # 要订阅的数据类型
+      data_types:
+        ticker: true         # 🔥 订阅行情数据获取价格
+        orderbook: false     # 🔥 不订阅订单簿数据
+        trades: false        # 成交数据
+        user_data: false     # 用户数据
+        
+      # 批量订阅配置
+      batch_subscription:
+        enabled: true        # 是否启用批量订阅
+        batch_size: 10       # 批量大小
+        delay_between_batches: 1  # 批次间延迟(秒)
+        
+    # 动态模式配置
+    dynamic:
+      # 市场发现配置
+      discovery:
+        enabled: true
+        # 过滤条件
+        filter_criteria:
+          market_types: ["perpetual"]        # 市场类型过滤（EdgeX只有合约）
+          volume_threshold: 500000           # 最小交易量过滤
+          max_symbols: 1000                  # 🔥 修改：大幅提高限制，订阅所有可用的永续合约
+          exclude_symbols: []                # 排除的交易对
+          include_patterns: ["*_USDT_PERP"]  # 包含的交易对模式
+          exclude_patterns: ["*TEST*"]       # 排除的交易对模式
+          
+      # 要订阅的数据类型
+      data_types:
+        ticker: true         # 🔥 订阅行情数据获取价格
+        orderbook: false     # 🔥 不订阅订单簿数据
+        trades: false        # 成交数据
+        user_data: false     # 用户数据
+        
+      # 动态订阅配置
+      dynamic_subscription:
+        auto_discovery_interval: 600  # 自动发现间隔(秒)
+        max_retry_attempts: 3         # 最大重试次数
+        retry_delay: 5                # 重试延迟(秒)
+        
+  # 🎯 自定义订阅组合配置
+  custom_subscriptions:
+    # 预定义的订阅组合
+    combinations:
+      # 主流币种组合
+      major_coins:
+        description: "🔥 主流币种永续合约价格数据订阅"
+        symbols:
+          - "BTC_USDT_PERP"
+          - "ETH_USDT_PERP"
+          - "SOL_USDT_PERP"
+        data_types:
+          ticker: true         # 🔥 订阅ticker获取价格
+          orderbook: false     # 🔥 不订阅订单簿数据
+          trades: false
+          
+      # 全量数据组合
+      full_data:
+        description: "🔥 永续合约价格数据订阅"
+        symbols:
+          - "BTC_USDT_PERP"
+          - "ETH_USDT_PERP"
+        data_types:
+          ticker: true         # 🔥 订阅ticker获取价格
+          orderbook: false     # 🔥 不订阅订单簿数据
+          trades: false        # 🔥 不订阅trades
+          user_data: false     # 🔥 不订阅用户数据
+          
+      # 仅价格数据组合
+      price_only:
+        description: "🔥 永续合约价格数据订阅"
+        symbols:
+          - "BTC_USDT_PERP"
+          - "ETH_USDT_PERP"
+          - "SOL_USDT_PERP"
+          - "AVAX_USDT_PERP"
+          - "DOGE_USDT_PERP"
+        data_types:
+          ticker: true         # 🔥 订阅ticker获取价格
+          orderbook: false     # 🔥 不订阅订单簿数据
+          trades: false
+          
+      # 高交易量组合
+      high_volume:
+        description: "🔥 高交易量永续合约价格数据订阅"
+        symbols:
+          - "BTC_USDT_PERP"
+          - "ETH_USDT_PERP"
+          - "SOL_USDT_PERP"
+          - "AVAX_USDT_PERP"
+          - "MATIC_USDT_PERP"
+          - "DOT_USDT_PERP"
+        data_types:
+          ticker: true         # 🔥 订阅ticker获取价格
+          orderbook: false     # 🔥 不订阅订单簿数据
+          trades: false
+          
+    # 活动的订阅组合
+    active_combination: "major_coins"  # 可选值: "major_coins", "full_data", "price_only", "high_volume", "custom"
+    
+    # 自定义组合配置 (当active_combination为"custom"时使用)
+    custom:
+      symbols: []
+      data_types:
+        ticker: true         # 🔥 订阅ticker获取价格
+        orderbook: false     # 🔥 不订阅订单簿数据
+        trades: false
+        user_data: false
+        
+  # API配置
+  api:
+    base_url: "https://pro.edgex.exchange/"
+    ws_url: "wss://quote.edgex.exchange/api/v1/public/ws"
+    version: "v1"
+    timeout: 30
+    
+  # 认证配置
+  authentication:
+    method: "hmac_sha256"
+    api_key: ""  # 在运行时设置
+    api_secret: ""  # 在运行时设置
+    
+  # 频率限制
+  rate_limits:
+    rest_api: 100  # 每秒REST API请求数
+    websocket: 10  # 每秒WebSocket订阅数
+    order_creation: 20  # 每秒下单数
+    order_cancellation: 50  # 每秒撤单数
+    
+  # 精度配置
+  precision:
+    price:
+      default: 2
+      BTC_USDT_PERP: 2
+      ETH_USDT_PERP: 2
+      SOL_USDT_PERP: 4
+      AVAX_USDT_PERP: 4
+      DOGE_USDT_PERP: 6
+      ADA_USDT_PERP: 6
+      MATIC_USDT_PERP: 6
+      DOT_USDT_PERP: 4
+      LINK_USDT_PERP: 4
+      UNI_USDT_PERP: 4
+      
+    quantity:
+      default: 4
+      BTC_USDT_PERP: 4
+      ETH_USDT_PERP: 4
+      SOL_USDT_PERP: 3
+      AVAX_USDT_PERP: 3
+      DOGE_USDT_PERP: 0
+      ADA_USDT_PERP: 0
+      MATIC_USDT_PERP: 0
+      DOT_USDT_PERP: 2
+      LINK_USDT_PERP: 2
+      UNI_USDT_PERP: 2
+      
+  # 符号映射配置已移除 - 现在由执行器统一处理格式转换
+    
+  # 手续费配置
+  fees:
+    maker: 0.0002  # 0.02%
+    taker: 0.0005  # 0.05%
+    funding: 0.0001  # 0.01%
+    
+  # 交易配置
+  trading:
+    min_order_size: 0.001  # 最小订单大小
+    max_order_size: 10000  # 最大订单大小
+    max_leverage: 100  # 最大杠杆
+    default_leverage: 10  # 默认杠杆
+    margin_mode: "cross"  # 默认保证金模式
+    
+  # 市场数据配置
+  market_data:
+    orderbook_limit: 100  # 默认订单簿深度
+    ticker_interval: 1000  # 行情更新间隔(毫秒)
+    trade_history_limit: 500  # 历史成交记录限制
+    
+  # WebSocket配置
+  websocket:
+    enabled: true
+    auto_reconnect: true
+    max_reconnect_attempts: -1  # 🔥 优化：无限重试，移除次数限制
+    reconnect_delay: 5  # 🔥 优化：重连延迟从5秒增加到5秒（基础延迟）
+    ping_interval: 60  # 🔥 优化：心跳间隔从30秒增加到60秒，降低服务器压力
+    heartbeat_interval: 30  # 🔥 新增：心跳检测间隔30秒
+    max_silence_time: 180  # 🔥 新增：最大静默时间180秒，增加容忍度
+    connection_timeout: 30  # 连接超时时间
+    close_timeout: 10  # 关闭超时时间
+    
+  # 错误处理配置
+  error_handling:
+    max_retries: 3
+    retry_delay: 1  # 重试延迟(秒)
+    retry_backoff: 2  # 重试退避倍数
+    
+  # 日志配置
+  logging:
+    level: "INFO"
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    
+  # 健康检查配置
+  health_check:
+    enabled: true
+    interval: 60  # 健康检查间隔(秒)
+    timeout: 10  # 健康检查超时(秒)
+    
+  # 开发配置
+  development:
+    sandbox: false  # 是否使用沙盒环境
+    debug: false  # 是否启用调试模式
+    mock_data: false  # 是否使用模拟数据 

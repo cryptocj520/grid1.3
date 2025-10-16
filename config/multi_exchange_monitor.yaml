@@ -1,0 +1,90 @@
+# 多交易所价格监控配置文件
+# Multi-Exchange Price Monitor Configuration
+
+# 交易所配置
+# 注意：仅订阅公共价格数据，无需配置API密钥
+exchanges:
+  hyperliquid:
+    enabled: true
+    api_key: ""      # 公共数据不需要填写
+    api_secret: ""   # 公共数据不需要填写
+    testnet: false
+    
+  binance:
+    enabled: true
+    api_key: ""      # 公共数据不需要填写  
+    api_secret: ""   # 公共数据不需要填写
+    testnet: false
+    
+  okx:
+    enabled: true
+    api_key: ""      # 公共数据不需要填写
+    api_secret: ""   # 公共数据不需要填写
+    passphrase: ""   # 公共数据不需要填写
+    testnet: false
+
+# 监控符号配置
+symbols:
+  # 现货交易对
+  spot:
+    - "WLFI/USDT"
+    - "XPL/USDT"
+    
+  # 永续合约
+  perpetual:
+    - "WLFI"
+    - "XPL"
+
+# 界面配置
+display:
+  # 刷新间隔（秒）
+  refresh_interval: 1.0
+  
+  # 价差阈值配置（超过此阈值高亮显示）
+  price_difference_threshold:
+    warning: 0.1   # 0.1% 警告
+    critical: 0.5  # 0.5% 重要
+    
+  # 表格显示配置
+  table:
+    show_timestamp: true
+    show_volume: false
+    precision: 6  # 价格显示精度
+    
+  # 颜色配置
+  colors:
+    normal: "white"
+    warning: "yellow"
+    critical: "red"
+    unavailable: "gray"
+
+# WebSocket 配置
+websocket:
+  # 连接超时（秒）
+  connection_timeout: 10
+  
+  # 重连配置
+  reconnect:
+    max_attempts: 5
+    delay: 5
+    
+  # 心跳配置
+  heartbeat_interval: 30
+
+# 日志配置
+logging:
+  level: "INFO"
+  file: "logs/multi_exchange_monitor.log"
+  console: true
+  
+# 数据配置
+data:
+  # 价格缓存时间（秒）
+  price_cache_ttl: 60
+  
+  # 最大价差记录数
+  max_spread_records: 1000
+  
+  # 是否保存价差历史
+  save_spread_history: true
+  history_file: "logs/spread_history.csv"

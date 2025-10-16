@@ -1,0 +1,340 @@
+# MESA交易系统日志配置
+# 版本: 1.0.0
+
+version: "1.0"
+environment: "development"  # development, testing, production
+root_level: "INFO"
+disable_existing_loggers: false
+log_directory: "logs"
+async_logging: false
+buffer_size: 1000
+flush_interval: 1.0
+enable_sensitive_data_filter: true
+log_file_permissions: 0o640
+
+# 处理器配置
+handlers:
+  # 控制台处理器 - 开发环境实时查看
+  console:
+    type: "console"
+    level: "INFO"
+    format: "colored"
+    enabled: true
+    include_module: true
+    include_thread: false
+    include_process: false
+    date_format: "%H:%M:%S"
+    exclude_modules:
+      - "websockets"
+      - "aiohttp"
+      - "asyncio"
+      - "urllib3"
+
+  # 主系统日志文件 (优化: 将级别从DEBUG提升到INFO以减少磁盘压力)
+  main_file:
+    type: "rotating_file"
+    level: "INFO"
+    format: "json"
+    enabled: true
+    filename: "logs/trading_system.log"
+    max_bytes: 5242880  # 5MB
+    backup_count: 3
+    include_module: true
+    include_thread: false
+    include_process: false
+    date_format: "%Y-%m-%d %H:%M:%S"
+
+  # 错误日志文件
+  error_file:
+    type: "rotating_file"
+    level: "ERROR"
+    format: "json"
+    enabled: true
+    filename: "logs/error.log"
+    max_bytes: 5242880  # 5MB
+    backup_count: 3
+    include_module: true
+    include_thread: true
+    include_process: false
+    date_format: "%Y-%m-%d %H:%M:%S"
+
+  # 数据流日志文件
+  data_file:
+    type: "rotating_file"
+    level: "INFO"
+    format: "json"
+    enabled: true
+    filename: "logs/data.log"
+    max_bytes: 5242880  # 5MB
+    backup_count: 3
+    include_module: false
+    include_thread: false
+    include_process: false
+    date_format: "%Y-%m-%d %H:%M:%S"
+    exclude_modules:
+      - "core.logging"
+
+  # 交易日志文件
+  trading_file:
+    type: "rotating_file"
+    level: "INFO"
+    format: "json"
+    enabled: true
+    filename: "logs/trading.log"
+    max_bytes: 5242880  # 5MB
+    backup_count: 3
+    include_module: true
+    include_thread: false
+    include_process: false
+    date_format: "%Y-%m-%d %H:%M:%S"
+
+  # 性能日志文件
+  performance_file:
+    type: "rotating_file"
+    level: "INFO"
+    format: "performance"
+    enabled: true
+    filename: "logs/performance.log"
+    max_bytes: 5242880  # 5MB
+    backup_count: 3
+    include_module: true
+    include_thread: false
+    include_process: false
+    date_format: "%Y-%m-%d %H:%M:%S"
+
+  # 交易所日志文件
+  exchange_file:
+    type: "rotating_file"
+    level: "INFO"
+    format: "json"
+    enabled: true
+    filename: "logs/exchanges.log"
+    max_bytes: 5242880  # 5MB
+    backup_count: 3
+    include_module: true
+    include_thread: false
+    include_process: false
+    date_format: "%Y-%m-%d %H:%M:%S"
+
+# 日志记录器配置
+loggers:
+  # 根日志记录器
+  root:
+    level: "INFO"
+    handlers: ["console", "main_file", "error_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+    include_correlation_id: false
+    include_performance_metrics: false
+
+  # 系统日志记录器
+  system:
+    level: "INFO"
+    handlers: ["console", "main_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+    include_correlation_id: false
+    include_performance_metrics: false
+
+  # 数据日志记录器
+  data:
+    level: "INFO"
+    handlers: ["data_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+    include_correlation_id: false
+    include_performance_metrics: true
+    max_message_length: 1000
+
+  # 错误日志记录器
+  errors:
+    level: "WARNING"
+    handlers: ["console", "main_file", "error_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+    include_correlation_id: true
+    include_performance_metrics: false
+
+  # 性能日志记录器
+  performance:
+    level: "INFO"
+    handlers: ["performance_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+    include_correlation_id: false
+    include_performance_metrics: true
+
+  # 交易日志记录器
+  trading:
+    level: "INFO"
+    handlers: ["console", "main_file", "trading_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+    include_correlation_id: true
+    include_performance_metrics: false
+
+  # 交易所日志记录器
+  exchanges:
+    level: "INFO"
+    handlers: ["console", "main_file", "exchange_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+    include_correlation_id: true
+    include_performance_metrics: false
+
+  # 核心模块日志配置
+  core:
+    level: "INFO"
+    handlers: ["console", "main_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+
+  # Socket.IO服务器日志
+  socketio:
+    level: "INFO"
+    handlers: ["console", "main_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+
+  # EdgeX交易所日志
+  edgex:
+    level: "INFO"
+    handlers: ["console", "exchange_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+    include_correlation_id: true
+
+  # Backpack交易所日志
+  backpack:
+    level: "INFO"
+    handlers: ["console", "exchange_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+    include_correlation_id: true
+
+  # 🔥 Backpack适配器日志（包含WebSocket）
+  ExchangeAdapter.backpack:
+    level: "INFO"
+    handlers: ["console", "exchange_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+    include_correlation_id: true
+
+  # 🔥 新增：Hyperliquid交易所日志
+  hyperliquid:
+    level: "INFO"
+    handlers: ["console", "exchange_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+    include_correlation_id: true
+
+  # WebSocket数据相关服务日志优化 (减少详细日志以节省磁盘空间)
+  MarketDataService:
+    level: "WARNING"
+    handlers: ["console", "main_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+
+  EnhancedMonitoringServiceImpl:
+    level: "WARNING"
+    handlers: ["console", "main_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+
+  SubscriptionService:
+    level: "WARNING"
+    handlers: ["console", "main_file"]
+    propagate: false
+    enabled: true
+    include_context: true
+
+  # 第三方库日志控制
+  websockets:
+    level: "ERROR"
+    handlers: ["error_file"]
+    propagate: false
+    enabled: true
+
+  aiohttp:
+    level: "ERROR"
+    handlers: ["error_file"]
+    propagate: false
+    enabled: true
+
+  asyncio:
+    level: "ERROR"
+    handlers: ["error_file"]
+    propagate: false
+    enabled: true
+
+  urllib3:
+    level: "ERROR"
+    handlers: ["error_file"]
+    propagate: false
+    enabled: true
+
+# 🔥 新增：交易所统计信息打印频率配置
+exchange_statistics_frequency:
+  # 根据交易所支持的币种数量动态调整统计信息打印频率
+  # 币种数量越多，打印频率越低，避免日志过于频繁
+  
+  # 默认配置（适用于小型交易所）
+  default:
+    message_stats_frequency: 100       # 每100条消息打印一次统计
+    callback_stats_frequency: 50       # 每50个回调打印一次统计
+    orderbook_stats_frequency: 50      # 每50个orderbook打印一次统计
+    global_callback_frequency: 50      # 每50个全局回调打印一次统计
+    
+  # EdgeX交易所（支持约50种币种）
+  edgex:
+    message_stats_frequency: 100       # 每100条消息打印一次统计
+    callback_stats_frequency: 50       # 每50个回调打印一次统计
+    orderbook_stats_frequency: 50      # 每50个orderbook打印一次统计
+    global_callback_frequency: 50      # 每50个全局回调打印一次统计
+    
+  # Backpack交易所（支持约30种币种）
+  backpack:
+    message_stats_frequency: 100       # 每100条消息打印一次统计
+    callback_stats_frequency: 30       # 每30个回调打印一次统计
+    orderbook_stats_frequency: 30      # 每30个orderbook打印一次统计
+    global_callback_frequency: 30      # 每30个全局回调打印一次统计
+    
+  # 🔥 Hyperliquid交易所（支持数百种币种）- 大幅降低打印频率
+  hyperliquid:
+    message_stats_frequency: 1000      # 每1000条消息打印一次统计
+    callback_stats_frequency: 500      # 每500个回调打印一次统计
+    orderbook_stats_frequency: 500     # 每500个orderbook打印一次统计
+    global_callback_frequency: 500     # 每500个全局回调打印一次统计
+    
+  # 自适应配置规则
+  adaptive_rules:
+    # 根据币种数量自动调整频率
+    # 如果币种数量超过threshold，则使用对应的multiplier
+    thresholds:
+      small_exchange: 
+        max_symbols: 50
+        multiplier: 1.0
+      medium_exchange:
+        max_symbols: 100
+        multiplier: 2.0
+      large_exchange:
+        max_symbols: 200
+        multiplier: 5.0
+      huge_exchange:
+        max_symbols: 500
+        multiplier: 10.0 

@@ -1,0 +1,128 @@
+# 套利决策引擎配置文件
+# 负责控制套利决策的各项参数和行为
+
+# 基础决策参数
+decision_params:
+  # 价差阈值（百分比）
+  min_spread_threshold: 0.05    # 最小价差5%才触发套利
+  max_spread_threshold: 5.0     # 最大价差5%，超过可能异常
+  
+  # 成交量阈值
+  min_volume_threshold: 1000    # 最小成交量要求
+  
+  # 风险控制
+  risk_score_threshold: 0.8     # 风险评分阈值
+  max_holding_time: 300         # 最大持仓时间（秒）
+
+# 仓位管理参数
+position_management:
+  # 每次开仓金额（USDC）
+  order_amount_usdc: 100.0      # 每次开仓100 USDC
+  
+  # 总仓位限制（USDC）
+  max_total_position_usdc: 1000.0  # 最大总仓位1000 USDC
+  
+  # 单个交易所最大仓位（USDC）
+  max_single_exchange_position_usdc: 500.0
+  
+  # 仓位计算模式
+  position_sizing_mode: "fixed"  # fixed: 固定金额, dynamic: 动态调整
+
+# 交易所权重配置
+exchange_weights:
+  # 权重越低，优先级越高（先下单）
+  backpack: 1     # 最高优先级
+  hyperliquid: 3  # 较低优先级
+  
+  # 权重模式
+  weight_mode: "priority"  # priority: 优先级模式, parallel: 并行模式（占位符）
+
+# 下单模式配置
+order_execution:
+  # 下单模式
+  execution_mode: "sequential"  # sequential: 先后下单, parallel: 同时下单（占位符）
+  
+  # 第一个交易所（权重高）订单设置
+  first_exchange:
+    order_type: "limit"         # limit: 限价单, market: 市价单
+    price_offset_percent: 0.01  # 价格偏移1%（限价单使用）
+    max_wait_time: 30           # 最大等待时间（秒）
+    polling_interval: 2         # 轮询间隔（秒）
+  
+  # 第二个交易所（权重低）订单设置
+  second_exchange:
+    order_type: "market"        # limit: 限价单, market: 市价单
+    price_offset_percent: 0.0   # 市价单不使用价格偏移
+    max_wait_time: 10           # 最大等待时间（秒）
+    polling_interval: 1         # 轮询间隔（秒）
+
+# 盈亏管理
+profit_management:
+  # 目标利润（USDC）
+  target_profit_usdc: 2.0       # 目标利润2 USDC
+  
+  # 止损设置（USDC）
+  stop_loss_usdc: -5.0          # 止损-5 USDC
+  
+  # 平仓模式
+  close_mode: "target_profit"   # target_profit: 达到目标利润, time_based: 时间平仓
+  
+  # 平仓检查间隔（秒）
+  close_check_interval: 5
+  
+  # 手续费率（用于利润计算）
+  fee_rate:
+    backpack: 0.002            # 0.2%
+    hyperliquid: 0.0003        # 0.03%
+
+# 精度管理
+precision_management:
+  # 精度兼容模式
+  compatibility_mode: "lowest"  # lowest: 向下兼容到最低精度, highest: 向上兼容到最高精度
+  
+  # 默认精度设置
+  default_precision:
+    price: 2                   # 价格精度
+    amount: 4                  # 数量精度
+  
+  # 精度调整策略
+  adjustment_strategy: "conservative"  # conservative: 保守策略, aggressive: 激进策略
+
+# 监控和日志
+monitoring:
+  # 启用详细日志
+  detailed_logging: true
+  
+  # 性能监控
+  performance_monitoring: true
+  
+  # 决策历史记录
+  decision_history: true
+  
+  # 最大历史记录数
+  max_history_records: 1000
+
+# 安全设置
+security:
+  # 启用安全检查
+  enable_safety_checks: true
+  
+  # 最大连续失败次数
+  max_consecutive_failures: 3
+  
+  # 失败后等待时间（秒）
+  failure_cooldown: 60
+  
+  # 启用资金保护
+  enable_fund_protection: true
+
+# 测试模式
+testing:
+  # 启用测试模式
+  test_mode: false
+  
+  # 测试用的小额度
+  test_amount_usdc: 10.0
+  
+  # 测试交易所
+  test_exchanges: ["backpack", "hyperliquid"] 

@@ -1,0 +1,142 @@
+# 符号转换配置文件
+# 统一管理所有交易所的符号格式转换规则
+
+# 系统标准格式定义
+standard_format:
+  pattern: "{base}-{quote}-{type}"  # 例如：BTC-USDC-PERP
+  separator: "-"
+  supported_types: ["PERP", "SPOT", "FUTURES"]
+  default_quote: "USDC"
+
+# 交易所格式定义
+exchange_formats:
+  hyperliquid:
+    format_type: "hyperliquid"
+    pattern: "{base}/{quote}:{type}"  # 例如：BTC/USDC:USDC
+    separator: "/"
+    type_separator: ":"
+    supported_types: ["USDC", "PERP", "SPOT"]  # 🔥 修复：Hyperliquid实际使用USDC作为type
+    default_quote: "USDC"
+    type_mapping:
+      PERP: "USDC"      # 🔥 修复：永续合约使用USDC格式
+      SPOT: "SPOT"
+      PERPETUAL: "USDC"  # 🔥 修复：永续合约使用USDC格式
+      USDC: "USDC"
+    
+  backpack:
+    format_type: "backpack"
+    pattern: "{base}_{quote}_{type}"  # 例如：BTC_USDC_PERP
+    separator: "_"
+    supported_types: ["PERP", "SPOT"]
+    default_quote: "USDC"
+    type_mapping:
+      PERP: "PERP"
+      SPOT: ""
+      PERPETUAL: "PERP"
+    
+  edgex:
+    format_type: "edgex"
+    pattern: "{base}_{quote}"  # 🔥 修复：EdgeX实际格式为BTC_USDT，没有_PERP后缀
+    separator: "_"
+    supported_types: [""]  # 🔥 修复：EdgeX不使用类型后缀
+    default_quote: "USDT"  # EdgeX主要使用USDT
+    quote_mapping:
+      USDC: "USDT"  # 将USDC映射为USDT
+    type_mapping:
+      PERP: ""      # 🔥 修复：EdgeX永续合约不使用类型后缀
+      SPOT: ""      # 🔥 修复：EdgeX不使用类型后缀
+      PERPETUAL: ""  # 🔥 修复：EdgeX不使用类型后缀
+    
+  binance:
+    format_type: "binance"
+    pattern: "{base}{quote}"  # 例如：BTCUSDT
+    separator: ""
+    supported_types: ["SPOT", "PERP"]
+    default_quote: "USDT"
+    quote_mapping:
+      USDC: "USDT"  # 将USDC映射为USDT
+    type_mapping:
+      PERP: ""  # 永续合约不需要后缀
+      SPOT: ""
+      PERPETUAL: ""
+
+# 符号映射规则（优先级高于格式转换）
+symbol_mappings:
+  # 标准格式到交易所格式的直接映射
+  standard_to_exchange:
+    hyperliquid:
+      "BTC-USDC-PERP": "BTC/USDC:USDC"
+      "ETH-USDC-PERP": "ETH/USDC:USDC"
+      "SOL-USDC-PERP": "SOL/USDC:USDC"
+      "AVAX-USDC-PERP": "AVAX/USDC:USDC"
+      "DOGE-USDC-PERP": "DOGE/USDC:USDC"
+      "ADA-USDC-PERP": "ADA/USDC:USDC"
+      "LINK-USDC-PERP": "LINK/USDC:USDC"
+    
+    backpack:
+      "BTC-USDC-PERP": "BTC_USDC_PERP"
+      "ETH-USDC-PERP": "ETH_USDC_PERP"
+      "SOL-USDC-PERP": "SOL_USDC_PERP"
+      "AVAX-USDC-PERP": "AVAX_USDC_PERP"
+      "DOGE-USDC-PERP": "DOGE_USDC_PERP"
+      "ADA-USDC-PERP": "ADA_USDC_PERP"
+      "LINK-USDC-PERP": "LINK_USDC_PERP"
+    
+    edgex:
+      "BTC-USDC-PERP": "BTC_USDT_PERP"
+      "ETH-USDC-PERP": "ETH_USDT_PERP"
+      "SOL-USDC-PERP": "SOL_USDT_PERP"
+      "AVAX-USDC-PERP": "AVAX_USDT_PERP"
+      "DOGE-USDC-PERP": "DOGE_USDT_PERP"
+      "ADA-USDC-PERP": "ADA_USDT_PERP"
+      "LINK-USDC-PERP": "LINK_USDT_PERP"
+    
+    binance:
+      "BTC-USDC-PERP": "BTCUSDT"
+      "ETH-USDC-PERP": "ETHUSDT"
+      "SOL-USDC-PERP": "SOLUSDT"
+      "AVAX-USDC-PERP": "AVAXUSDT"
+      "DOGE-USDC-PERP": "DOGEUSDT"
+
+# 验证规则
+validation:
+  standard_format:
+    min_length: 7  # 最小长度：BTC-USD
+    max_length: 50
+    required_separators: ["-"]
+    valid_base_pattern: "^[A-Z0-9]+$"
+    valid_quote_pattern: "^[A-Z0-9]+$"
+    valid_types: ["PERP", "SPOT", "FUTURES"]
+  
+  exchange_formats:
+    hyperliquid:
+      min_length: 7  # 最小长度：BTC/USD
+      max_length: 50
+      required_separators: ["/", ":"]
+    
+    backpack:
+      min_length: 7  # 最小长度：BTC_USD
+      max_length: 50
+      required_separators: ["_"]
+    
+    edgex:
+      min_length: 7  # 最小长度：BTC_USD
+      max_length: 50
+      required_separators: ["_"]
+    
+    binance:
+      min_length: 6  # 最小长度：BTCUSD
+      max_length: 50
+      required_separators: []
+
+# 缓存配置
+cache:
+  enabled: true
+  ttl: 3600  # 缓存时间（秒）
+  max_size: 10000  # 最大缓存条目数
+
+# 日志配置
+logging:
+  level: "INFO"
+  enable_conversion_log: true
+  enable_performance_log: false 

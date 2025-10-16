@@ -1,0 +1,142 @@
+# Hyperliquid交易所配置示例
+# 此文件展示如何配置Hyperliquid交易所的市场类型
+
+hyperliquid:
+  # 基础配置
+  name: "Hyperliquid"
+  exchange_id: "hyperliquid"
+  
+  # 🚀 示例1：只订阅永续合约市场
+  market_types:
+    perpetual:
+      enabled: true        # 启用永续合约
+      suffix: ":PERP"
+      description: "永续合约市场"
+      
+    spot:
+      enabled: false       # 禁用现货市场
+      suffix: ":SPOT"
+      description: "现货市场"
+      
+    priority: "perpetual"  # 优先级设置为永续合约
+    default_market: "perpetual"
+    
+  # 🚀 示例2：只订阅现货市场
+  # 如果您只想订阅现货，请将上面的配置改为：
+  # market_types:
+  #   perpetual:
+  #     enabled: false
+  #   spot:
+  #     enabled: true
+  #   priority: "spot"
+  #   default_market: "spot"
+    
+  # 🚀 示例3：同时订阅两种市场
+  # 如果您想同时订阅，请将上面的配置改为：
+  # market_types:
+  #   perpetual:
+  #     enabled: true
+  #   spot:
+  #     enabled: true
+  #   priority: "both"
+  #   default_market: "perpetual"  # 默认优先永续合约
+    
+  # API配置
+  api:
+    base_url: "https://api.hyperliquid.xyz"
+    ws_url: "wss://api.hyperliquid.xyz/ws"
+    
+  # 认证配置（可选）
+  authentication:
+    api_key: ""
+    wallet_address: ""
+    
+  # 支持的交易对配置
+  symbols:
+    # 永续合约交易对
+    perpetual:
+      - "BTC/USDC:PERP"
+      - "ETH/USDC:PERP"
+      - "SOL/USDC:PERP"
+      - "AVAX/USDC:PERP"
+      - "DOGE/USDC:PERP"
+      - "ADA/USDC:PERP"
+      - "LINK/USDC:PERP"
+      - "UNI/USDC:PERP"
+      
+    # 现货交易对
+    spot:
+      - "BTC/USDC:SPOT"
+      - "ETH/USDC:SPOT"
+      - "SOL/USDC:SPOT"
+      - "AVAX/USDC:SPOT"
+      
+  # 符号映射
+  symbol_mapping:
+    perpetual:
+      "BTC/USDC:PERP": "BTC"
+      "ETH/USDC:PERP": "ETH"
+      "SOL/USDC:PERP": "SOL"
+      "AVAX/USDC:PERP": "AVAX"
+      "DOGE/USDC:PERP": "DOGE"
+      "ADA/USDC:PERP": "ADA"
+      "LINK/USDC:PERP": "LINK"
+      "UNI/USDC:PERP": "UNI"
+      
+    spot:
+      "BTC/USDC:SPOT": "BTC"
+      "ETH/USDC:SPOT": "ETH"
+      "SOL/USDC:SPOT": "SOL"
+      "AVAX/USDC:SPOT": "AVAX"
+      
+  # WebSocket配置
+  websocket:
+    enabled: true
+    auto_reconnect: true
+    max_reconnect_attempts: 5
+    reconnect_delay: 5
+    
+    # 订阅配置
+    subscriptions:
+      perpetual:
+        allMids: true         # 所有中间价（ticker数据）
+        l2Book: true          # 订单簿深度
+        trades: false         # 交易记录（可选）
+        activeAssetCtx: true  # 活跃资产上下文
+        
+      spot:
+        allMids: true         # 所有中间价
+        l2Book: true          # 订单簿深度
+        trades: false         # 交易记录
+        activeAssetCtx: false # 现货通常不需要
+        
+  # 日志配置
+  logging:
+    level: "INFO"
+    
+  # 开发配置
+  development:
+    debug: false
+    
+# 🔧 配置说明：
+# 
+# 1. 只订阅永续合约：
+#    - 设置 perpetual.enabled = true
+#    - 设置 spot.enabled = false
+#    - 设置 priority = "perpetual"
+#
+# 2. 只订阅现货：
+#    - 设置 perpetual.enabled = false
+#    - 设置 spot.enabled = true
+#    - 设置 priority = "spot"
+#
+# 3. 同时订阅两种市场：
+#    - 设置 perpetual.enabled = true
+#    - 设置 spot.enabled = true
+#    - 设置 priority = "both"
+#    - 设置 default_market 为主要使用的市场
+#
+# 4. 符号格式：
+#    - 永续合约：BTC/USDC:PERP
+#    - 现货：BTC/USDC:SPOT
+#    - 系统会根据配置自动转换基础币种（如BTC）为相应格式 

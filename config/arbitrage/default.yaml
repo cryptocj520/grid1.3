@@ -1,0 +1,99 @@
+# MESA套利系统默认配置文件
+# 版本: 1.0.0
+
+# 系统基础配置
+system_name: "MESA-Arbitrage-System"
+version: "1.0.0"
+environment: "development"
+
+# 交易所对配置
+exchange_pairs:
+  - primary_exchange: "backpack"
+    secondary_exchange: "edgex"
+    symbols:
+      - "BTCUSDT"
+      - "ETHUSDT"
+      - "SOLUSDT"
+    enabled: true
+
+# 套利配置
+arbitrage:
+  enabled: true
+  symbols:
+    - "BTCUSDT"
+    - "ETHUSDT"
+    - "SOLUSDT"
+  min_profit_threshold: "0.1"     # 最小利润阈值 (%)
+  max_position_duration: 300      # 最大持仓时间 (秒)
+  price_update_interval: 1.0      # 价格更新间隔 (秒)
+  order_timeout: 30               # 订单超时时间 (秒)
+  retry_attempts: 3               # 重试次数
+  enable_notifications: true      # 启用通知
+  log_level: "INFO"               # 日志级别
+  
+  # 风险限制配置
+  risk_limits:
+    max_position_value: "1000"    # 最大持仓价值 (USDT)
+    max_daily_trades: 100         # 每日最大交易次数
+    max_loss_per_trade: "50"      # 单笔最大亏损 (USDT)
+    max_daily_loss: "200"         # 每日最大亏损 (USDT)
+    min_spread_threshold: "0.1"   # 最小价差阈值 (%)
+    max_spread_threshold: "5.0"   # 最大价差阈值 (%)，用于异常检测
+    position_timeout_minutes: 30  # 持仓超时分钟数
+    max_slippage_percentage: "0.5" # 最大滑点百分比
+    emergency_stop_loss: "500"    # 紧急止损点 (USDT)
+
+# 监控配置
+monitoring:
+  enable_web_interface: true      # 启用Web界面
+  web_port: 8080                  # Web端口
+  enable_metrics: true            # 启用指标收集
+  metrics_interval: 60            # 指标收集间隔 (秒)
+  enable_alerts: true             # 启用告警
+  alert_channels:                 # 告警渠道
+    - "email"
+    - "webhook"
+  log_level: "INFO"               # 日志级别
+  log_file: "logs/arbitrage.log"  # 日志文件路径
+
+# 通知配置
+notifications:
+  enabled: true                   # 启用通知
+  
+  # 邮件通知
+  email_enabled: false
+  email_smtp_server: ""
+  email_smtp_port: 587
+  email_username: ""
+  email_password: ""
+  email_recipients: []
+  
+  # Webhook通知
+  webhook_enabled: false
+  webhook_url: ""
+  webhook_secret: ""
+  
+  # Telegram通知
+  telegram_enabled: false
+  telegram_bot_token: ""
+  telegram_chat_id: ""
+
+# 回测配置
+backtest:
+  enabled: false                  # 是否启用回测模式
+  start_date: "2024-01-01"        # 回测开始日期
+  end_date: "2024-12-31"          # 回测结束日期
+  initial_balance: "10000"        # 初始余额 (USDT)
+  data_source: "historical"       # 数据源
+
+# 数据库配置
+database_url: "sqlite:///arbitrage.db"
+
+# Redis配置 (用于缓存)
+redis_url: "redis://localhost:6379/0"
+redis_enabled: false
+
+# 性能配置
+max_workers: 4                    # 最大工作线程数
+price_cache_ttl: 5                # 价格缓存TTL (秒)
+order_timeout: 30                 # 订单超时 (秒) 

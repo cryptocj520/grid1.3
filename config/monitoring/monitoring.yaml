@@ -1,0 +1,140 @@
+# 全局监控系统配置
+# 该配置文件只定义监控系统的全局行为和策略
+
+# 全局监控配置
+enabled: true
+global_max_symbols: 1000  # 全局交易对数量限制
+update_interval: 1000  # 毫秒
+health_check_interval: 30  # 秒
+reconnect_delay: 5  # 秒
+max_reconnect_attempts: 10
+data_retention_hours: 24
+enable_statistics: true
+enable_symbol_limits: false  # 是否启用交易对数量限制
+
+# 🔥 符号管理配置 - 修复重叠计算逻辑
+symbol_management:
+  # 符号获取策略
+  strategy: "overlap"              # 🔥 修改：使用overlap策略，只订阅重叠符号
+  
+  # 重叠计算配置
+  overlap_settings:
+    min_exchange_count: 2          # 最少支持的交易所数量（2个即可重叠）
+    use_overlap_only: true         # 🔥 修复：启用重叠模式，只订阅重叠符号
+    max_symbols_per_exchange: 0    # 🔥 修复：在重叠分析时不限制符号数量（0表示无限制）
+    cache_duration: 86400          # 缓存时间（秒），24小时
+    startup_timeout: 30            # 启动获取超时时间
+    
+    # 🔥 新增：重叠计算详细配置
+    overlap_calculation:
+      method: "base_symbol_match"  # 基于基础符号匹配（BTC, ETH等）
+      ignore_quote_currency: true # 忽略计价货币差异（USDC vs USDT）
+      log_overlap_analysis: true  # 记录重叠分析详情
+      enable_symbol_filtering: false  # 禁用符号过滤（不预设小币种）
+    
+  # 故障处理
+  fallback:
+    use_predefined_list: true      # 获取失败时使用预定义列表
+    predefined_symbols:            # 预定义的安全列表
+      - "BTC_USDT_PERP"
+      - "ETH_USDT_PERP"
+      - "SOL_USDT_PERP"
+      - "AVAX_USDT_PERP"
+      - "DOGE_USDT_PERP"
+      - "ADA_USDT_PERP"
+      - "DOT_USDT_PERP"
+      - "MATIC_USDT_PERP"
+      - "LINK_USDT_PERP"
+      - "UNI_USDT_PERP"
+
+# 价差监控配置
+price_spread_monitoring:
+  enabled: true                    # 启用价差监控
+  min_spread_threshold: 0.001      # 最小价差阈值（0.1%）
+  max_spread_threshold: 0.05       # 最大价差阈值（5%）
+  update_frequency: 1000           # 价差计算频率（毫秒）
+  alert_threshold: 0.01            # 价差告警阈值（1%）
+  log_large_spreads: true          # 记录大价差
+  comparison_pairs:                # 价差对比组合
+    - exchanges: ["hyperliquid", "backpack"]
+      description: "Hyperliquid vs Backpack"
+    - exchanges: ["hyperliquid", "edgex"]
+      description: "Hyperliquid vs EdgeX"
+    - exchanges: ["backpack", "edgex"]
+      description: "Backpack vs EdgeX"
+    - exchanges: ["hyperliquid", "backpack", "edgex"]
+      description: "三交易所价差对比"
+
+# 全局默认设置
+defaults:
+  # 默认数据类型（交易所可以覆盖）
+  data_types:
+    - "ticker"                     # 🔥 修改：只订阅ticker数据
+  # 默认速率限制
+  rate_limit:
+    requests_per_minute: 100
+  # 默认WebSocket设置
+  websocket_enabled: true
+  rest_fallback: true
+  # 默认最大交易对数量
+  max_symbols: 1000
+
+# 监控系统行为配置
+monitoring:
+  # 交易所配置文件目录
+  exchange_configs_dir: "config/exchanges"
+  # 启用的交易所（从配置文件中读取）
+  enabled_exchanges:
+    - "hyperliquid"              # 🔥 启用Hyperliquid
+    - "backpack"                 # 🔥 启用Backpack
+    - "edgex"                    # 🔥 启用EdgeX
+    # - "binance"                # 暂时禁用Binance
+  
+  # 配置文件加载策略
+  config_loading:
+    # 是否使用交易所配置文件
+    use_exchange_configs: true
+    # 交易所配置文件路径模式
+    config_file_pattern: "{exchange}_config.yaml"
+    # 配置文件加载失败时的处理
+    fallback_to_defaults: true
+
+# 🔥 数据处理配置 - 新增
+data_processing:
+  # 价格数据处理
+  price_data:
+    normalize_symbols: true        # 标准化交易对符号
+    filter_outliers: true         # 过滤异常价格
+    cache_duration: 30             # 价格数据缓存时间（秒）
+    
+  # 实时数据聚合
+  real_time_aggregation:
+    enabled: true
+    window_size: 5000             # 聚合窗口大小（毫秒）
+    metrics:
+      - "price"                   # 价格
+      - "volume"                  # 成交量
+      - "spread"                  # 价差
+
+# 性能监控配置
+performance:
+  # 是否启用性能监控
+  enabled: true
+  # 性能指标收集间隔（秒）
+  metrics_interval: 60
+  # 内存使用监控
+  memory_monitoring: true
+  # 连接状态监控
+  connection_monitoring: true
+
+# 日志配置
+logging:
+  # 监控系统日志级别
+  level: "INFO"
+  # 是否记录详细的订阅信息
+  log_subscriptions: true
+  # 是否记录数据接收统计
+  log_data_stats: true
+  # 🔥 价差监控日志
+  log_spreads: true               # 记录价差信息
+  log_arbitrage_opportunities: true  # 记录套利机会 
