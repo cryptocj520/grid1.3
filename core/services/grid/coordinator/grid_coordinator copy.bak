@@ -1,0 +1,2979 @@
+"""
+网格交易系统协调器
+
+核心协调逻辑：
+1. 初始化网格系统
+2. 处理订单成交事件
+3. 自动挂反向订单
+4. 异常处理和暂停恢复
+"""
+
+import asyncio
+import time
+from typing import Any, Dict, List, Optional
+from decimal import Decimal
+from datetime import datetime
+
+from ....logging import get_logger
+from ..interfaces import IGridStrategy, IGridEngine, IPositionTracker
+from ..models import (
+    GridConfig, GridState, GridOrder, GridOrderSide,
+    GridOrderStatus, GridStatus, GridStatistics
+)
+from ..scalping import ScalpingManager
+from ..capital_protection import CapitalProtectionManager
+from ..take_profit import TakeProfitManager
+from ..price_lock import PriceLockManager
+
+
+class GridCoordinator:
+    """
+    网格交易系统协调器
+
+    职责：
+    1. 整合策略、引擎、跟踪器
+    2. 订单成交后的反向挂单逻辑
+    3. 批量成交处理
+    4. 系统状态管理
+    5. 异常处理
+    """
+
+    def __init__(
+        self,
+        config: GridConfig,
+        strategy: IGridStrategy,
+        engine: IGridEngine,
+        tracker: IPositionTracker,
+        grid_state: GridState
+    ):
+        """
+        初始化协调器
+
+        Args:
+            config: 网格配置
+            strategy: 网格策略
+            engine: 执行引擎
+            tracker: 持仓跟踪器
+            grid_state: 网格状态（共享实例）
+        """
+        self.logger = get_logger(__name__)
+        self.config = config
+        self.strategy = strategy
+        self.engine = engine
+        self.tracker = tracker
+
+        # 🔥 设置 engine 的 coordinator 引用（用于 health_checker 访问剥头皮管理器等）
+        if hasattr(engine, 'coordinator'):
+            engine.coordinator = self
+
+        # 网格状态（使用传入的共享实例）
+        self.state = grid_state
+
+        # 运行控制
+        self._running = False
+        self._paused = False
+        self._resetting = False  # 🔥 重置进行中标志（本金保护、剥头皮重置等）
+
+        # 异常计数
+        self._error_count = 0
+        self._max_errors = 5  # 最大错误次数，超过则暂停
+
+        # 🔥 价格移动网格专用
+        self._price_escape_start_time: Optional[float] = None  # 价格脱离开始时间
+        self._last_escape_check_time: float = 0  # 上次检查时间
+        self._escape_check_interval: int = 10  # 检查间隔（秒）
+        self._is_resetting: bool = False  # 是否正在重置网格
+
+        # 🔥 剥头皮管理器
+        self.scalping_manager: Optional[ScalpingManager] = None
+        self._scalping_position_monitor_task: Optional[asyncio.Task] = None
+        self._scalping_position_check_interval: int = 1  # 剥头皮模式持仓检查间隔（秒，REST轮询）
+        self._last_ws_position_size = Decimal('0')  # 用于WebSocket事件驱动
+        self._last_ws_position_price = Decimal('0')
+        # 🔥 持仓监控状态（类似订单统计的混合模式）
+        self._position_ws_enabled: bool = False  # WebSocket持仓监控是否启用
+        self._last_position_ws_time: float = 0  # 最后一次收到WebSocket持仓更新的时间
+        self._last_order_filled_time: float = 0  # 最后一次订单成交的时间（用于判断WS是否失效）
+        self._position_ws_response_timeout: int = 5  # 订单成交后WebSocket响应超时（秒）
+        self._position_ws_check_interval: int = 5  # 尝试恢复WebSocket的间隔（秒）
+        self._last_position_ws_check_time: float = 0  # 上次检查WebSocket的时间
+        # 🔥 定期REST校验（心跳检测）
+        self._position_rest_verify_interval: int = 60  # 每分钟用REST校验WebSocket持仓（秒）
+        self._last_position_rest_verify_time: float = 0  # 上次REST校验的时间
+        if config.is_scalping_enabled():
+            self.scalping_manager = ScalpingManager(config)
+            self.logger.info("✅ 剥头皮管理器已启用")
+
+        # 🛡️ 本金保护管理器
+        self.capital_protection_manager: Optional[CapitalProtectionManager] = None
+        if config.is_capital_protection_enabled():
+            self.capital_protection_manager = CapitalProtectionManager(config)
+            self.logger.info("✅ 本金保护管理器已启用")
+
+        # 💰 止盈管理器
+        self.take_profit_manager: Optional[TakeProfitManager] = None
+        if config.take_profit_enabled:
+            self.take_profit_manager = TakeProfitManager(config)
+            self.logger.info("✅ 止盈管理器已启用")
+
+        # 🔒 价格锁定管理器
+        self.price_lock_manager: Optional[PriceLockManager] = None
+        if config.price_lock_enabled:
+            self.price_lock_manager = PriceLockManager(config)
+            self.logger.info("✅ 价格锁定管理器已启用")
+
+        # 💰 账户余额轮询（Backpack统一账户）
+        self._balance_monitor_task: Optional[asyncio.Task] = None
+        self._balance_update_interval: int = 10  # 余额更新间隔（秒，用户自定义）
+        self._spot_balance: Decimal = Decimal('0')  # 现货余额（未用作保证金）
+        self._collateral_balance: Decimal = Decimal('0')  # 抵押品余额（用作保证金）
+        self._order_locked_balance: Decimal = Decimal('0')  # 订单冻结余额
+        self._last_balance_update: Optional[datetime] = None
+
+        self.logger.info(f"网格协调器初始化: {config}")
+
+    async def initialize(self):
+        """初始化网格系统"""
+        try:
+            self.logger.info("开始初始化网格系统...")
+
+            # 1. 先初始化执行引擎（设置 engine.config）
+            await self.engine.initialize(self.config)
+            self.logger.info("执行引擎初始化完成")
+
+            # 🔥 价格移动网格：获取当前价格并设置价格区间
+            if self.config.is_follow_mode():
+                current_price = await self.engine.get_current_price()
+                self.config.update_price_range_for_follow_mode(current_price)
+                self.logger.info(
+                    f"价格移动网格：根据当前价格 ${current_price:,.2f} 设置价格区间 "
+                    f"[${self.config.lower_price:,.2f}, ${self.config.upper_price:,.2f}]"
+                )
+
+            # 2. 初始化网格状态
+            self.state.initialize_grid_levels(
+                self.config.grid_count,
+                self.config.get_grid_price
+            )
+            self.logger.info(f"网格状态初始化完成，共{self.config.grid_count}个网格层级")
+
+            # 3. 初始化策略，生成所有初始订单
+            initial_orders = self.strategy.initialize(self.config)
+
+            # 🔥 价格移动网格：价格区间在初始化后才设置
+            if self.config.is_follow_mode():
+                self.logger.info(
+                    f"策略初始化完成，生成{len(initial_orders)}个初始订单，"
+                    f"覆盖价格区间 [${self.config.lower_price:,.2f}, ${self.config.upper_price:,.2f}]"
+                )
+            else:
+                self.logger.info(
+                    f"策略初始化完成，生成{len(initial_orders)}个初始订单，"
+                    f"覆盖价格区间 ${self.config.lower_price:,.2f} - ${self.config.upper_price:,.2f}"
+                )
+
+            # 4. 订阅订单更新
+            self.engine.subscribe_order_updates(self._on_order_filled)
+            self.logger.info("订单更新订阅完成")
+
+            # 🔄 4.5. 订阅WebSocket持仓更新（实时同步持仓）
+            # 🚀 策略：WebSocket优先，REST备用，WebSocket重连
+            self._position_ws_enabled = False  # WebSocket持仓订阅状态
+            self._position_sync_task = None    # 持仓同步任务
+
+            # 🔍 诊断：检查WebSocket持仓缓存状态
+            if hasattr(self.engine.exchange, '_position_cache'):
+                cache_status = self.engine.exchange._position_cache
+                self.logger.info(
+                    f"📊 WebSocket持仓缓存状态: {len(cache_status)} 个交易对")
+                if self.config.symbol in cache_status:
+                    cached_pos = cache_status[self.config.symbol]
+                    self.logger.info(
+                        f"   {self.config.symbol}: 数量={cached_pos.get('size')}, "
+                        f"成本=${cached_pos.get('entry_price')}, "
+                        f"缓存时间={cached_pos.get('timestamp')}"
+                    )
+                else:
+                    self.logger.info(
+                        f"   {self.config.symbol}: 暂无缓存数据（等待WebSocket推送）")
+            else:
+                self.logger.warning("⚠️ WebSocket持仓缓存不存在")
+
+            try:
+                self.logger.info("🔄 订阅WebSocket持仓更新流...")
+
+                # 订阅WebSocket持仓回调
+                if hasattr(self.engine.exchange, 'subscribe_position_updates'):
+                    await self.engine.exchange.subscribe_position_updates(
+                        self.config.symbol,
+                        self._on_position_update
+                    )
+                    self._position_ws_enabled = True
+                    self.logger.info("✅ WebSocket持仓更新流订阅成功")
+                    self.logger.info("📡 使用WebSocket实时监控持仓变化")
+                else:
+                    self.logger.warning("⚠️ 交易所不支持WebSocket持仓订阅")
+
+            except Exception as e:
+                self.logger.warning(f"⚠️ WebSocket持仓订阅失败: {e}")
+                import traceback
+                self.logger.error(traceback.format_exc())
+                self._position_ws_enabled = False
+
+            # 🔄 无论WebSocket是否成功，都先用REST API同步初始持仓
+            try:
+                self.logger.info("📊 正在同步初始持仓数据（REST API）...")
+                positions = await self.engine.exchange.get_positions([self.config.symbol])
+                if positions:
+                    position = positions[0]
+                    position_qty = position.size if position.side.value.lower() == 'long' else - \
+                        position.size
+                    self.tracker.sync_initial_position(
+                        position=position_qty,
+                        entry_price=position.entry_price
+                    )
+                    self.logger.info(
+                        f"✅ 初始持仓同步完成（REST）: {position.side.value} {position.size} @ ${position.entry_price}"
+                    )
+                else:
+                    self.logger.info("📊 REST API显示无持仓")
+            except Exception as rest_error:
+                self.logger.warning(f"⚠️ REST API初始持仓同步失败: {rest_error}")
+
+            # 🔥 提前设置_running标志，确保监控任务能正常运行
+            self._running = True
+
+            # 🔄 启动持仓同步监控任务（REST备用 + WebSocket重连）
+            self._position_sync_task = asyncio.create_task(
+                self._position_sync_monitor())
+            self.logger.info("✅ 持仓同步监控已启动（WebSocket优先，REST备用，自动重连）")
+
+            # 5. 批量下所有初始订单（关键修改）
+            self.logger.info(f"开始批量挂单，共{len(initial_orders)}个订单...")
+            placed_orders = await self.engine.place_batch_orders(initial_orders)
+
+            # 6. 批量添加到状态追踪（只添加未成交的订单）
+            self.logger.info(f"开始添加{len(placed_orders)}个订单到状态追踪...")
+            added_count = 0
+            skipped_count = 0
+            for order in placed_orders:
+                # 🔥 检查订单是否已经在状态中（可能已经通过WebSocket成交回调处理）
+                if order.order_id in self.state.active_orders:
+                    skipped_count += 1
+                    self.logger.debug(
+                        f"⏭️ 跳过已存在订单: {order.order_id} (Grid {order.grid_id}, {order.side.value})"
+                    )
+                    continue
+
+                # 🔥 检查订单是否已经成交（状态为FILLED）
+                if order.status == GridOrderStatus.FILLED:
+                    skipped_count += 1
+                    self.logger.debug(
+                        f"⏭️ 跳过已成交订单: {order.order_id} (Grid {order.grid_id}, {order.side.value})"
+                    )
+                    continue
+
+                self.state.add_order(order)
+                added_count += 1
+                self.logger.debug(
+                    f"✅ 已添加订单到状态: {order.order_id} (Grid {order.grid_id}, {order.side.value})")
+
+            self.logger.info(
+                f"✅ 成功挂出{len(placed_orders)}/{len(initial_orders)}个订单，"
+                f"覆盖整个价格区间"
+            )
+            self.logger.info(
+                f"📊 订单添加统计: 新增={added_count}, 跳过={skipped_count} "
+                f"(已存在或已成交)"
+            )
+            self.logger.info(
+                f"📊 状态统计: "
+                f"买单={self.state.pending_buy_orders}, "
+                f"卖单={self.state.pending_sell_orders}, "
+                f"活跃订单={len(self.state.active_orders)}"
+            )
+
+            # 7. 启动系统
+            self.state.start()
+            # self._running = True  # 已在启动监控任务前设置
+
+            self.logger.info("✅ 网格系统初始化完成，所有订单已就位，等待成交")
+
+        except Exception as e:
+            self.logger.error(f"❌ 网格系统初始化失败: {e}")
+            self.state.set_error()
+            raise
+
+    async def _on_position_update(self, position_info: Dict[str, Any]):
+        """
+        WebSocket持仓更新回调 - 实时同步持仓到追踪器
+
+        Args:
+            position_info: 持仓信息字典
+                - symbol: 交易对
+                - size: 持仓数量（带符号，正数=多仓，负数=空仓）
+                - entry_price: 入场价格
+                - unrealized_pnl: 未实现盈亏
+                - side: 持仓方向
+        """
+        try:
+            symbol = position_info.get('symbol')
+            if symbol != self.config.symbol:
+                return  # 不是当前交易对的持仓
+
+            position_size = position_info.get('size', 0)
+            entry_price = position_info.get('entry_price', 0)
+            side = position_info.get('side', 'Unknown')
+
+            # 同步持仓到追踪器
+            self.tracker.sync_initial_position(
+                position=position_size,
+                entry_price=entry_price
+            )
+
+            # 🔥 更新WebSocket最后接收时间（用于健康检查）
+            self._last_position_ws_time = time.time()
+
+            # 🔥 更新WebSocket持仓记录（用于REST校验对比）
+            self._last_ws_position_size = position_size
+            self._last_ws_position_price = entry_price
+
+            # 🔥 标记WebSocket持仓监控为启用状态
+            if not self._position_ws_enabled:
+                self._position_ws_enabled = True
+                self.logger.info("✅ WebSocket持仓监控已启用（收到首次持仓更新）")
+
+            # 🔥 使用INFO级别，确保用户能看到持仓更新
+            self.logger.info(
+                f"📊 WebSocket持仓同步: {symbol} {side} "
+                f"数量={position_size}, 成本=${entry_price}"
+            )
+
+        except Exception as e:
+            self.logger.error(f"❌ 处理WebSocket持仓更新失败: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+
+    async def _position_sync_monitor(self):
+        """
+        持仓同步监控任务
+
+        功能：
+        1. 监控WebSocket持仓更新是否正常
+        2. 如果WebSocket失败，使用REST API作为备用
+        3. 定期尝试重连WebSocket
+        4. 一旦WebSocket恢复，切换回WebSocket
+        """
+        # 初始化时间戳
+        self._last_position_ws_time = time.time()  # WebSocket最后接收持仓数据的时间
+        self._last_position_rest_sync = 0  # REST API最后同步的时间
+        last_rest_log_time = 0  # REST备用模式最后打印日志的时间
+
+        # 配置参数（参考订单统计的混合模式）
+        rest_sync_interval = self._scalping_position_check_interval  # REST备用同步间隔（1秒，确保实时性）
+        ws_reconnect_interval = self._position_ws_check_interval  # WebSocket重连尝试间隔（5秒）
+        monitor_check_interval = 1  # 监控检查间隔（1秒，与REST同步频率一致）
+        rest_log_interval = 60  # REST备用模式日志打印间隔（60秒/1分钟，避免刷屏）
+
+        self.logger.info(
+            f"🔄 持仓同步监控已启动: "
+            f"WS响应超时={self._position_ws_response_timeout}秒, "
+            f"REST校验间隔={self._position_rest_verify_interval}秒, "
+            f"REST备用轮询={rest_sync_interval}秒, "
+            f"WS重连间隔={ws_reconnect_interval}秒"
+        )
+
+        last_ws_reconnect_attempt = 0
+
+        while self._running:
+            try:
+                await asyncio.sleep(monitor_check_interval)
+
+                current_time = time.time()
+
+                # 🔍 检查WebSocket健康状态（智能判断）
+                if self._position_ws_enabled:
+                    ws_should_fail = False
+
+                    # 🔥 条件1：订单成交了，但WebSocket没有响应
+                    if self._last_order_filled_time > 0:
+                        order_ws_delay = current_time - self._last_order_filled_time
+                        ws_response_delay = self._last_order_filled_time - self._last_position_ws_time
+
+                        # 如果订单成交后超过N秒，WebSocket还没推送持仓更新
+                        if order_ws_delay > self._position_ws_response_timeout and ws_response_delay > 0:
+                            self.logger.warning(
+                                f"⚠️ WebSocket失效: 订单成交{order_ws_delay:.1f}秒后仍无持仓更新，"
+                                f"切换到REST备用模式"
+                            )
+                            ws_should_fail = True
+
+                    # 🔥 条件2：剥头皮模式下持仓为0（异常情况）
+                    if self.scalping_manager and self.scalping_manager.is_active():
+                        current_position = self.tracker.get_current_position()
+                        if abs(current_position) == 0:
+                            self.logger.warning(
+                                f"⚠️ WebSocket异常: 剥头皮模式下持仓为0（不应该发生），"
+                                f"切换到REST备用模式"
+                            )
+                            ws_should_fail = True
+
+                    if ws_should_fail:
+                        self._position_ws_enabled = False
+
+                # 🔥 条件3：定期REST校验（每分钟心跳检测）
+                if self._position_ws_enabled:
+                    time_since_last_verify = current_time - self._last_position_rest_verify_time
+
+                    if time_since_last_verify >= self._position_rest_verify_interval:
+                        try:
+                            # 使用REST API获取实时持仓
+                            positions = await self.engine.exchange.get_positions([self.config.symbol])
+
+                            if positions and len(positions) > 0:
+                                position = positions[0]
+                                rest_position = position.size or Decimal('0')
+
+                                # 根据方向确定持仓符号
+                                if hasattr(position, 'side'):
+                                    from ....adapters.exchanges import PositionSide
+                                    if position.side == PositionSide.SHORT and rest_position != 0:
+                                        rest_position = -rest_position
+
+                                # 对比WebSocket持仓和REST持仓
+                                ws_position = self._last_ws_position_size
+
+                                # 允许微小误差（0.01）
+                                position_diff = abs(
+                                    rest_position - ws_position)
+
+                                if position_diff > Decimal('0.01'):
+                                    self.logger.warning(
+                                        f"⚠️ WebSocket持仓校验失败: "
+                                        f"WS={ws_position}, REST={rest_position}, "
+                                        f"差异={position_diff}, 切换到REST备用模式"
+                                    )
+                                    self._position_ws_enabled = False
+
+                                    # 立即用REST数据更新持仓
+                                    if self.scalping_manager and self.scalping_manager.is_active():
+                                        initial_capital = self.scalping_manager.get_initial_capital()
+                                        self.scalping_manager.update_position(
+                                            rest_position, position.entry_price,
+                                            initial_capital, self._collateral_balance
+                                        )
+                                        self._last_ws_position_size = rest_position
+                                        self._last_ws_position_price = position.entry_price
+
+                                        # 更新止盈订单
+                                        await self._update_take_profit_order_if_needed()
+                                else:
+                                    # 🔥 使用INFO级别，确保用户能看到校验正在进行
+                                    self.logger.info(
+                                        f"✅ WebSocket持仓校验通过: WS={ws_position}, REST={rest_position}"
+                                    )
+
+                            self._last_position_rest_verify_time = current_time
+
+                        except Exception as e:
+                            self.logger.warning(f"⚠️ REST持仓校验失败: {e}")
+                            self._last_position_rest_verify_time = current_time
+
+                # 🔄 REST备用同步（仅当WebSocket失败时启用，每秒轮询）
+                if not self._position_ws_enabled:
+                    if current_time - self._last_position_rest_sync > rest_sync_interval:
+                        try:
+                            positions = await self.engine.exchange.get_positions([self.config.symbol])
+                            if positions:
+                                position = positions[0]
+                                position_qty = position.size if position.side.value.lower() == 'long' else - \
+                                    position.size
+
+                                # 同步到持仓追踪器
+                                self.tracker.sync_initial_position(
+                                    position=position_qty,
+                                    entry_price=position.entry_price
+                                )
+                                self._last_position_rest_sync = current_time
+
+                                # 🔥 剥头皮模式：检查持仓变化并更新止盈订单
+                                if self.scalping_manager and self.scalping_manager.is_active():
+                                    old_position = self._last_ws_position_size
+
+                                    if position_qty != old_position:
+                                        # 更新ScalpingManager
+                                        initial_capital = self.scalping_manager.get_initial_capital()
+                                        self.scalping_manager.update_position(
+                                            position_qty, position.entry_price,
+                                            initial_capital, self._collateral_balance
+                                        )
+
+                                        # 更新止盈订单
+                                        await self._update_take_profit_order_if_needed()
+
+                                        # 更新记录
+                                        self._last_ws_position_size = position_qty
+                                        self._last_ws_position_price = position.entry_price
+
+                                        self.logger.info(
+                                            f"📡 REST备用同步: 数量 {old_position} → {position_qty}, "
+                                            f"成本=${position.entry_price:.2f}"
+                                        )
+                                    else:
+                                        # 🔥 持仓未变化，但定期打印日志让用户知道REST备用在运行
+                                        if current_time - last_rest_log_time >= rest_log_interval:
+                                            self.logger.info(
+                                                f"📡 REST备用模式运行中: {position.side.value} {position.size} @ ${position.entry_price:.2f}"
+                                            )
+                                            last_rest_log_time = current_time
+                                else:
+                                    # 非剥头皮模式，定期记录日志
+                                    if current_time - last_rest_log_time >= rest_log_interval:
+                                        self.logger.info(
+                                            f"📡 REST备用模式运行中: {position.side.value} {position.size} @ ${position.entry_price:.2f}"
+                                        )
+                                        last_rest_log_time = current_time
+                            else:
+                                self._last_position_rest_sync = current_time
+                                # 无持仓时也定期打印
+                                if current_time - last_rest_log_time >= rest_log_interval:
+                                    self.logger.info("📡 REST备用模式运行中: 无持仓")
+                                    last_rest_log_time = current_time
+                        except Exception as e:
+                            self.logger.warning(f"⚠️ REST持仓同步失败: {e}")
+
+                # 🔄 尝试重连WebSocket（如果WebSocket失败且达到重连间隔）
+                if not self._position_ws_enabled and (current_time - last_ws_reconnect_attempt > ws_reconnect_interval):
+                    try:
+                        self.logger.info("🔄 尝试重新订阅WebSocket持仓更新...")
+
+                        if hasattr(self.engine.exchange, 'subscribe_position_updates'):
+                            await self.engine.exchange.subscribe_position_updates(
+                                self.config.symbol,
+                                self._on_position_update
+                            )
+                            self._position_ws_enabled = True
+                            self._last_position_ws_time = current_time
+                            self.logger.info("✅ WebSocket持仓订阅重连成功！")
+
+                        last_ws_reconnect_attempt = current_time
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ WebSocket重连失败: {e}")
+                        last_ws_reconnect_attempt = current_time
+
+            except asyncio.CancelledError:
+                self.logger.info("🔄 持仓同步监控任务已取消")
+                break
+            except Exception as e:
+                self.logger.error(f"❌ 持仓同步监控错误: {e}")
+                import traceback
+                self.logger.error(traceback.format_exc())
+                await asyncio.sleep(10)  # 错误后等待10秒再继续
+
+        self.logger.info("🔄 持仓同步监控任务已退出")
+
+    async def _on_order_filled(self, filled_order: GridOrder):
+        """
+        订单成交回调 - 核心逻辑
+
+        当订单成交时：
+        1. 记录成交信息
+        2. 检查剥头皮模式
+        3. 计算反向订单参数
+        4. 立即挂反向订单
+
+        Args:
+            filled_order: 已成交订单
+        """
+        try:
+            # 🔥 关键检查：防止在重置期间处理订单
+            if self._paused:
+                self.logger.warning("系统已暂停，跳过订单处理")
+                return
+
+            if self._resetting:
+                self.logger.warning("⚠️ 系统正在重置中，跳过订单处理")
+                return
+
+            self.logger.info(
+                f"📢 订单成交: {filled_order.side.value} "
+                f"{filled_order.filled_amount}@{filled_order.filled_price} "
+                f"(Grid {filled_order.grid_id})"
+            )
+
+            # 🔥 记录订单成交时间（用于判断WebSocket是否失效）
+            self._last_order_filled_time = time.time()
+
+            # 1. 更新状态
+            self.state.mark_order_filled(
+                filled_order.order_id,
+                filled_order.filled_price,
+                filled_order.filled_amount or filled_order.amount
+            )
+
+            # 2. 记录到持仓跟踪器
+            self.tracker.record_filled_order(filled_order)
+
+            # 🔥 3. 检查剥头皮模式
+            if self.scalping_manager:
+                # 检查是否是止盈订单成交
+                if self._is_take_profit_order_filled(filled_order):
+                    await self._handle_take_profit_filled()
+                    return  # 止盈成交后不再挂反向订单
+
+                # 更新持仓信息到剥头皮管理器
+                current_position = self.tracker.get_current_position()
+                average_cost = self.tracker.get_average_cost()
+                initial_capital = self.scalping_manager.get_initial_capital()
+                self.scalping_manager.update_position(
+                    current_position, average_cost, initial_capital, self._collateral_balance)
+
+                # 检查是否需要更新止盈订单
+                await self._update_take_profit_order_if_needed()
+
+            # 🛡️ 3.5. 检查本金保护模式
+            if self.capital_protection_manager:
+                current_price = filled_order.filled_price
+                current_grid_index = self.config.find_nearest_grid_index(
+                    current_price)
+                await self._check_capital_protection_mode(current_price, current_grid_index)
+
+            # 4. 计算反向订单参数
+            # 🔥 剥头皮模式下可能不挂反向订单
+            if self.scalping_manager and self.scalping_manager.is_active():
+                # 剥头皮模式：只挂建仓单，不挂平仓单
+                if not self._should_place_reverse_order_in_scalping(filled_order):
+                    self.logger.info(f"🔴 剥头皮模式: 不挂反向订单")
+                    return
+
+            new_side, new_price, new_grid_id = self.strategy.calculate_reverse_order(
+                filled_order,
+                self.config.grid_interval,
+                self.config.reverse_order_grid_distance
+            )
+
+            # 5. 创建反向订单
+            reverse_order = GridOrder(
+                order_id="",  # 等待执行引擎填充
+                grid_id=new_grid_id,
+                side=new_side,
+                price=new_price,
+                amount=filled_order.filled_amount or filled_order.amount,  # 数量完全一致
+                status=GridOrderStatus.PENDING,
+                created_at=datetime.now(),
+                parent_order_id=filled_order.order_id
+            )
+
+            # 6. 下反向订单
+            placed_order = await self.engine.place_order(reverse_order)
+            self.state.add_order(placed_order)
+
+            # 7. 记录关联关系
+            filled_order.reverse_order_id = placed_order.order_id
+
+            self.logger.info(
+                f"✅ 反向订单已挂: {new_side.value} "
+                f"{reverse_order.amount}@{new_price} "
+                f"(Grid {new_grid_id})"
+            )
+
+            # 8. 更新当前价格
+            current_price = await self.engine.get_current_price()
+            current_grid_id = self.config.get_grid_index_by_price(
+                current_price)
+            self.state.update_current_price(current_price, current_grid_id)
+
+            # 🔥 9. 检查是否触发或退出剥头皮模式
+            await self._check_scalping_mode(current_price, current_grid_id)
+
+            # 重置错误计数
+            self._error_count = 0
+
+        except Exception as e:
+            self.logger.error(f"❌ 处理订单成交失败: {e}")
+            self._handle_error(e)
+
+    async def _on_batch_orders_filled(self, filled_orders: List[GridOrder]):
+        """
+        批量订单成交处理
+
+        处理价格剧烈波动导致的多订单同时成交
+
+        Args:
+            filled_orders: 已成交订单列表
+        """
+        try:
+            # 🔥 关键检查：防止在重置期间处理订单
+            if self._paused:
+                self.logger.warning("系统已暂停，跳过批量订单处理")
+                return
+
+            if self._resetting:
+                self.logger.warning("⚠️ 系统正在重置中，跳过批量订单处理")
+                return
+
+            self.logger.info(
+                f"⚡ 批量成交: {len(filled_orders)}个订单"
+            )
+
+            # 1. 批量更新状态和记录
+            for order in filled_orders:
+                self.state.mark_order_filled(
+                    order.order_id,
+                    order.filled_price,
+                    order.filled_amount or order.amount
+                )
+                self.tracker.record_filled_order(order)
+
+            # 2. 批量计算反向订单
+            reverse_params = self.strategy.calculate_batch_reverse_orders(
+                filled_orders,
+                self.config.grid_interval,
+                self.config.reverse_order_grid_distance
+            )
+
+            # 3. 创建反向订单列表
+            reverse_orders = []
+            for side, price, grid_id, amount in reverse_params:
+                order = GridOrder(
+                    order_id="",
+                    grid_id=grid_id,
+                    side=side,
+                    price=price,
+                    amount=amount,
+                    status=GridOrderStatus.PENDING,
+                    created_at=datetime.now()
+                )
+                reverse_orders.append(order)
+
+            # 4. 批量下单
+            placed_orders = await self.engine.place_batch_orders(reverse_orders)
+
+            # 5. 批量更新状态
+            for order in placed_orders:
+                self.state.add_order(order)
+
+            self.logger.info(
+                f"✅ 批量反向订单已挂: {len(placed_orders)}个"
+            )
+
+            # 6. 更新当前价格
+            current_price = await self.engine.get_current_price()
+            current_grid_id = self.config.get_grid_index_by_price(
+                current_price)
+            self.state.update_current_price(current_price, current_grid_id)
+
+            # 重置错误计数
+            self._error_count = 0
+
+        except Exception as e:
+            self.logger.error(f"❌ 批量处理订单成交失败: {e}")
+            self._handle_error(e)
+
+    def _handle_error(self, error: Exception):
+        """
+        处理异常
+
+        策略：
+        1. 记录错误
+        2. 增加错误计数
+        3. 超过阈值则暂停系统
+
+        Args:
+            error: 异常对象
+        """
+        self._error_count += 1
+
+        self.logger.error(
+            f"异常发生 ({self._error_count}/{self._max_errors}): {error}"
+        )
+
+        # 如果错误次数过多，暂停系统
+        if self._error_count >= self._max_errors:
+            self.logger.error(
+                f"❌ 错误次数达到上限({self._max_errors})，暂停系统"
+            )
+            asyncio.create_task(self.pause())
+
+    async def start(self):
+        """启动网格系统"""
+        if self._running:
+            self.logger.warning("网格系统已经在运行")
+            return
+
+        await self.initialize()
+        await self.engine.start()
+
+        # 🔥 主动同步初始持仓到WebSocket缓存
+        # Backpack的WebSocket只在持仓变化时推送，不会推送初始状态
+        # 所以我们需要在启动时主动获取一次
+        position_data = {'size': Decimal('0'), 'entry_price': Decimal(
+            '0'), 'unrealized_pnl': Decimal('0')}
+        try:
+            self.logger.info("📊 正在同步初始持仓数据...")
+            position_data = await self.engine.get_real_time_position(self.config.symbol)
+
+            # 如果WebSocket缓存为空，使用REST API获取并同步
+            if position_data['size'] == 0 and position_data['entry_price'] == 0:
+                positions = await self.engine.exchange.get_positions(symbols=[self.config.symbol])
+                if positions and len(positions) > 0:
+                    position = positions[0]
+                    real_size = position.size or Decimal('0')
+                    real_entry_price = position.entry_price or Decimal('0')
+
+                    # 同步到WebSocket缓存
+                    if hasattr(self.engine.exchange, '_position_cache'):
+                        self.engine.exchange._position_cache[self.config.symbol] = {
+                            'size': real_size,
+                            'entry_price': real_entry_price,
+                            'unrealized_pnl': position.unrealized_pnl or Decimal('0'),
+                            'side': 'Long' if real_size > 0 else 'Short',
+                            'timestamp': datetime.now()
+                        }
+                        self.logger.info(
+                            f"✅ 初始持仓已同步到WebSocket缓存: "
+                            f"{real_size} {self.config.symbol.split('_')[0]}, "
+                            f"成本=${real_entry_price:,.2f}"
+                        )
+                        # 更新position_data供后续使用
+                        position_data = {
+                            'size': real_size,
+                            'entry_price': real_entry_price,
+                            'unrealized_pnl': position.unrealized_pnl or Decimal('0')
+                        }
+            else:
+                # WebSocket缓存已有数据
+                self.logger.info(
+                    f"✅ WebSocket缓存已有持仓数据: "
+                    f"{position_data['size']} {self.config.symbol.split('_')[0]}, "
+                    f"成本=${position_data['entry_price']:,.2f}"
+                )
+        except Exception as e:
+            self.logger.warning(f"同步初始持仓失败（不影响运行）: {e}")
+
+        # 🔥 检查是否应该立即激活剥头皮模式
+        # 如果启动时已有持仓，且价格已在触发阈值以下，立即激活
+        if self.config.is_scalping_enabled():
+            try:
+                current_price = await self.engine.get_current_price()
+                current_grid_id = self.config.get_grid_index_by_price(
+                    current_price)
+
+                # 更新scalping_manager的持仓信息
+                if position_data['size'] != 0:
+                    initial_capital = self.scalping_manager.get_initial_capital()
+                    self.scalping_manager.update_position(
+                        position_data['size'],
+                        position_data['entry_price'],
+                        initial_capital,
+                        self._collateral_balance
+                    )
+
+                # 检查是否应该触发剥头皮模式（需要传递current_price和current_grid_id）
+                if self.scalping_manager.should_trigger(current_price, current_grid_id):
+                    self.logger.info(
+                        f"🎯 检测到启动时已在触发区域 (Grid {current_grid_id} <= "
+                        f"Grid {self.config.get_scalping_trigger_grid()})，立即激活剥头皮模式"
+                    )
+                    await self._activate_scalping_mode()
+                else:
+                    self.logger.info(
+                        f"📊 剥头皮模式待触发 (当前: Grid {current_grid_id}, "
+                        f"触发点: Grid {self.config.get_scalping_trigger_grid()})"
+                    )
+            except Exception as e:
+                self.logger.warning(f"检查剥头皮模式失败: {e}")
+                import traceback
+                self.logger.error(traceback.format_exc())
+
+        # 🔥 价格移动网格：启动价格脱离监控
+        if self.config.is_follow_mode():
+            asyncio.create_task(self._price_escape_monitor())
+            self.logger.info("✅ 价格脱离监控已启动")
+
+        # 💰 启动余额轮询监控
+        self._balance_monitor_task = asyncio.create_task(
+            self._balance_monitor_loop())
+        self.logger.info(f"✅ 账户余额轮询已启动（间隔{self._balance_update_interval}秒）")
+
+        self.logger.info("🚀 网格系统已启动")
+
+    async def pause(self):
+        """暂停网格系统（保留挂单）"""
+        self._paused = True
+        self.state.pause()
+
+        self.logger.info("⏸️ 网格系统已暂停")
+
+    async def resume(self):
+        """恢复网格系统"""
+        self._paused = False
+        self._error_count = 0  # 重置错误计数
+        self.state.resume()
+
+        self.logger.info("▶️ 网格系统已恢复")
+
+    async def stop(self):
+        """停止网格系统（取消所有挂单）"""
+        self._running = False
+        self._paused = False
+
+        # 💰 停止余额监控任务
+        if self._balance_monitor_task:
+            self._balance_monitor_task.cancel()
+            try:
+                await self._balance_monitor_task
+            except asyncio.CancelledError:
+                pass
+            self.logger.info("✅ 余额监控已停止")
+
+        # 🔄 停止持仓同步监控任务
+        if hasattr(self, '_position_sync_task') and self._position_sync_task:
+            self._position_sync_task.cancel()
+            try:
+                await self._position_sync_task
+            except asyncio.CancelledError:
+                pass
+            self.logger.info("✅ 持仓同步监控已停止")
+
+        # 取消所有挂单
+        cancelled_count = await self.engine.cancel_all_orders()
+        self.logger.info(f"取消了{cancelled_count}个挂单")
+
+        # 停止引擎
+        await self.engine.stop()
+
+        # 更新状态
+        self.state.stop()
+
+        self.logger.info("⏹️ 网格系统已停止")
+
+    async def get_statistics(self) -> GridStatistics:
+        """
+        获取统计数据（优先使用WebSocket真实持仓）
+
+        Returns:
+            网格统计数据
+        """
+        # 更新当前价格
+        try:
+            current_price = await self.engine.get_current_price()
+            current_grid_id = self.config.get_grid_index_by_price(
+                current_price)
+            self.state.update_current_price(current_price, current_grid_id)
+        except Exception as e:
+            self.logger.warning(f"获取当前价格失败: {e}")
+
+        # 🔥 同步engine的最新订单统计到state
+        self._sync_orders_from_engine()
+
+        # 获取统计数据（本地追踪器）
+        stats = self.tracker.get_statistics()
+
+        # 🔥 优先使用WebSocket缓存的真实持仓数据（但需要检查WebSocket是否可用）
+        # 注意：只有在WebSocket缓存有效且WebSocket监控正常时才使用缓存
+        try:
+            position_data = await self.engine.get_real_time_position(self.config.symbol)
+            ws_position = position_data['size']
+            ws_entry_price = position_data['entry_price']
+            has_cache = position_data.get('has_cache', False)
+
+            # 🔥 关键修复：只有在WebSocket启用且缓存有效时才使用WebSocket缓存
+            # 如果WebSocket已失效（切换到REST备用模式），则使用PositionTracker数据
+            if has_cache and self._position_ws_enabled:
+                stats.current_position = ws_position
+                stats.average_cost = ws_entry_price
+                stats.position_data_source = "WebSocket缓存"  # 🔥 标记数据来源
+
+                # 重新计算未实现盈亏（使用WebSocket的真实持仓）
+                if ws_position != 0 and current_price > 0:
+                    stats.unrealized_profit = ws_position * \
+                        (current_price - ws_entry_price)
+
+                self.logger.debug(
+                    f"📊 使用WebSocket缓存持仓: {ws_position}, 成本=${ws_entry_price}"
+                )
+            else:
+                # WebSocket失效或缓存无效，使用PositionTracker的数据
+                # 判断PositionTracker的数据来源
+                if self._position_ws_enabled:
+                    stats.position_data_source = "WebSocket回调"  # 🔥 通过WebSocket回调同步到Tracker
+                else:
+                    stats.position_data_source = "REST API备用"  # 🔥 通过REST API备用模式同步到Tracker
+
+                self.logger.debug(
+                    f"📊 使用PositionTracker: {stats.current_position}, "
+                    f"成本=${stats.average_cost}, 来源={stats.position_data_source} "
+                    f"(WS启用={self._position_ws_enabled}, 缓存={has_cache})"
+                )
+        except Exception as e:
+            # 如果获取WebSocket数据失败，使用本地追踪器的数据
+            stats.position_data_source = "PositionTracker"  # 🔥 降级到Tracker
+            self.logger.debug(f"获取WebSocket持仓失败，使用本地追踪器数据: {e}")
+
+        # 🔥 添加监控方式信息
+        stats.monitoring_mode = self.engine.get_monitoring_mode()
+
+        # 💰 使用真实的账户余额（从 collateral API 轮询获取）
+        stats.spot_balance = self._spot_balance
+        stats.collateral_balance = self._collateral_balance
+        stats.order_locked_balance = self._order_locked_balance
+        stats.total_balance = self._spot_balance + \
+            self._collateral_balance + self._order_locked_balance
+
+        # 🛡️ 本金保护模式状态
+        if self.capital_protection_manager:
+            stats.capital_protection_enabled = True
+            stats.capital_protection_active = self.capital_protection_manager.is_active()
+            stats.initial_capital = self.capital_protection_manager.get_initial_capital()
+            stats.capital_profit_loss = self.capital_protection_manager.get_profit_loss(
+                self._collateral_balance)
+
+        # 🔄 价格脱离监控状态（价格移动网格专用）
+        if self.config.is_follow_mode() and self._price_escape_start_time is not None:
+            import time
+            escape_duration = int(time.time() - self._price_escape_start_time)
+            stats.price_escape_active = True
+            stats.price_escape_duration = escape_duration
+            stats.price_escape_timeout = self.config.follow_timeout
+            stats.price_escape_remaining = max(
+                0, self.config.follow_timeout - escape_duration)
+
+            # 判断脱离方向
+            if current_price < self.config.lower_price:
+                stats.price_escape_direction = "down"
+            elif current_price > self.config.upper_price:
+                stats.price_escape_direction = "up"
+
+        # 💰 止盈模式状态
+        if self.take_profit_manager:
+            stats.take_profit_enabled = True
+            stats.take_profit_active = self.take_profit_manager.is_active()
+            stats.take_profit_initial_capital = self.take_profit_manager.get_initial_capital()
+            stats.take_profit_current_profit = self.take_profit_manager.get_profit_amount(
+                self._collateral_balance)
+            stats.take_profit_profit_rate = self.take_profit_manager.get_profit_percentage(
+                self._collateral_balance)
+            stats.take_profit_threshold = self.config.take_profit_percentage * 100  # 转为百分比
+
+        # 🔒 价格锁定模式状态
+        if self.price_lock_manager:
+            stats.price_lock_enabled = True
+            stats.price_lock_active = self.price_lock_manager.is_locked()
+            stats.price_lock_threshold = self.config.price_lock_threshold
+
+        return stats
+
+    def get_state(self) -> GridState:
+        """获取网格状态"""
+        return self.state
+
+    def is_running(self) -> bool:
+        """是否运行中"""
+        return self._running and not self._paused
+
+    def is_paused(self) -> bool:
+        """是否暂停"""
+        return self._paused
+
+    def is_stopped(self) -> bool:
+        """是否已停止"""
+        return not self._running
+
+    def get_status_text(self) -> str:
+        """获取状态文本"""
+        if self._paused:
+            return "⏸️ 已暂停"
+        elif self._running:
+            return "🟢 运行中"
+        else:
+            return "⏹️ 已停止"
+
+    async def _scalping_position_monitor_loop(self):
+        """
+        [已弃用] 剥头皮模式持仓监控循环（REST API轮询方式）
+
+        ⚠️ 此方法已被WebSocket事件驱动方式取代，保留仅作备份
+        现在使用 _on_position_update_from_ws() 实时处理持仓更新
+        """
+        self.logger.warning("⚠️ 使用了已弃用的REST API轮询监控（应该使用WebSocket事件驱动）")
+        self.logger.info("📊 剥头皮持仓监控循环已启动")
+
+        last_position = Decimal('0')
+        last_entry_price = Decimal('0')
+
+        try:
+            while self.scalping_manager and self.scalping_manager.is_active():
+                try:
+                    # 从API获取实时持仓
+                    position_data = await self.engine.get_real_time_position(self.config.symbol)
+                    current_position = position_data['size']
+                    current_entry_price = position_data['entry_price']
+
+                    # 检查是否有变化
+                    position_changed = (
+                        current_position != last_position or
+                        current_entry_price != last_entry_price
+                    )
+
+                    if position_changed:
+                        self.logger.info(
+                            f"📊 持仓变化检测: "
+                            f"数量 {last_position} → {current_position}, "
+                            f"成本 ${last_entry_price:,.2f} → ${current_entry_price:,.2f}"
+                        )
+
+                        # 更新剥头皮管理器的持仓信息
+                        initial_capital = self.scalping_manager.get_initial_capital()
+                        self.scalping_manager.update_position(
+                            current_position, current_entry_price, initial_capital, self._collateral_balance)
+
+                        # 更新止盈订单
+                        await self._update_take_profit_order_after_position_change(
+                            current_position,
+                            current_entry_price
+                        )
+
+                        # 更新记录
+                        last_position = current_position
+                        last_entry_price = current_entry_price
+
+                    # 等待下次检查
+                    await asyncio.sleep(self._scalping_position_check_interval)
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self.logger.error(f"持仓监控出错: {e}")
+                    await asyncio.sleep(self._scalping_position_check_interval)
+
+        except asyncio.CancelledError:
+            self.logger.info("📊 剥头皮持仓监控循环已取消")
+        except Exception as e:
+            self.logger.error(f"持仓监控循环异常: {e}")
+        finally:
+            self.logger.info("📊 剥头皮持仓监控循环已结束")
+
+    async def _update_take_profit_order_after_position_change(
+        self,
+        new_position: Decimal,
+        new_entry_price: Decimal
+    ):
+        """
+        持仓变化后更新止盈订单
+
+        Args:
+            new_position: 新的持仓数量
+            new_entry_price: 新的平均成本价
+        """
+        if new_position == 0:
+            # 持仓归零，取消止盈订单
+            if self.scalping_manager.get_current_take_profit_order():
+                tp_order = self.scalping_manager.get_current_take_profit_order()
+                try:
+                    await self.engine.cancel_order(tp_order.order_id)
+                    self.state.remove_order(tp_order.order_id)
+                    self.logger.info("✅ 持仓归零，已取消止盈订单")
+                except Exception as e:
+                    self.logger.error(f"取消止盈订单失败: {e}")
+            return
+
+        # 取消旧止盈订单
+        old_tp_order = self.scalping_manager.get_current_take_profit_order()
+        if old_tp_order:
+            try:
+                await self.engine.cancel_order(old_tp_order.order_id)
+                self.state.remove_order(old_tp_order.order_id)
+                self.logger.info(f"🔄 已取消旧止盈订单: {old_tp_order.order_id}")
+            except Exception as e:
+                self.logger.error(f"取消旧止盈订单失败: {e}")
+
+        # 挂新止盈订单
+        await self._place_take_profit_order()
+        self.logger.info("✅ 止盈订单已更新")
+
+    async def _on_position_update_from_ws(self, position_info: Dict[str, Any]) -> None:
+        """
+        WebSocket持仓更新回调（事件驱动，实时响应）
+
+        当WebSocket收到持仓更新推送时自动调用
+        """
+        try:
+            # 只在剥头皮模式激活时处理
+            if not self.scalping_manager or not self.scalping_manager.is_active():
+                return
+
+            # 只处理当前交易对的持仓
+            if position_info.get('symbol') != self.config.symbol:
+                return
+
+            current_position = position_info.get('size', Decimal('0'))
+            entry_price = position_info.get('entry_price', Decimal('0'))
+
+            # 检查是否有变化
+            position_changed = (
+                current_position != self._last_ws_position_size or
+                entry_price != self._last_ws_position_price
+            )
+
+            if position_changed:
+                self.logger.info(
+                    f"📊 WebSocket持仓变化: "
+                    f"数量 {self._last_ws_position_size} → {current_position}, "
+                    f"成本 ${self._last_ws_position_price:,.2f} → ${entry_price:,.2f}"
+                )
+
+                # 更新剥头皮管理器
+                initial_capital = self.scalping_manager.get_initial_capital()
+                self.scalping_manager.update_position(
+                    current_position, entry_price, initial_capital, self._collateral_balance)
+
+                # 更新止盈订单
+                await self._update_take_profit_order_after_position_change(
+                    current_position,
+                    entry_price
+                )
+
+                # 更新记录
+                self._last_ws_position_size = current_position
+                self._last_ws_position_price = entry_price
+
+        except Exception as e:
+            self.logger.error(f"处理WebSocket持仓更新失败: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+
+    def __repr__(self) -> str:
+        return (
+            f"GridCoordinator("
+            f"status={self.get_status_text()}, "
+            f"position={self.tracker.get_current_position()}, "
+            f"errors={self._error_count})"
+        )
+
+    # ==================== 价格移动网格专用方法 ====================
+
+    async def _price_escape_monitor(self):
+        """
+        价格脱离监控（价格移动网格专用）
+
+        定期检查价格是否脱离网格范围，如果脱离时间超过阈值则重置网格
+        """
+        import time
+
+        self.logger.info("🔍 价格脱离监控循环已启动")
+
+        while self._running and not self._paused:
+            try:
+                current_time = time.time()
+
+                # 检查间隔
+                if current_time - self._last_escape_check_time < self._escape_check_interval:
+                    await asyncio.sleep(1)
+                    continue
+
+                self._last_escape_check_time = current_time
+
+                # 获取当前价格
+                current_price = await self.engine.get_current_price()
+
+                # 检查是否脱离
+                should_reset, direction = self.config.check_price_escape(
+                    current_price)
+
+                if should_reset:
+                    # 记录脱离开始时间
+                    if self._price_escape_start_time is None:
+                        self._price_escape_start_time = current_time
+                        self.logger.warning(
+                            f"⚠️ 价格脱离网格范围（{direction}方向）: "
+                            f"当前价格=${current_price:,.2f}, "
+                            f"网格区间=[${self.config.lower_price:,.2f}, ${self.config.upper_price:,.2f}]"
+                        )
+
+                    # 检查脱离时间是否超过阈值
+                    escape_duration = current_time - self._price_escape_start_time
+
+                    if escape_duration >= self.config.follow_timeout:
+                        self.logger.warning(
+                            f"🔄 价格脱离超时（{escape_duration:.0f}秒 >= {self.config.follow_timeout}秒），"
+                            f"准备重置网格..."
+                        )
+                        await self._reset_grid_for_price_follow(current_price, direction)
+                        self._price_escape_start_time = None
+                    else:
+                        self.logger.info(
+                            f"⏳ 价格脱离中（{direction}方向），"
+                            f"已持续 {escape_duration:.0f}/{self.config.follow_timeout}秒"
+                        )
+                else:
+                    # 价格回到范围内，重置脱离计时
+                    if self._price_escape_start_time is not None:
+                        self.logger.info(
+                            f"✅ 价格已回到网格范围内: ${current_price:,.2f}"
+                        )
+                        self._price_escape_start_time = None
+
+                    # 🔒 检查是否需要解除价格锁定
+                    if self.price_lock_manager and self.price_lock_manager.is_locked():
+                        if self.price_lock_manager.check_unlock_condition(
+                            current_price,
+                            self.config.lower_price,
+                            self.config.upper_price
+                        ):
+                            self.price_lock_manager.deactivate_lock()
+                            self.logger.info("🔓 价格锁定已解除，恢复正常网格交易")
+
+                await asyncio.sleep(1)
+
+            except asyncio.CancelledError:
+                self.logger.info("价格脱离监控已停止")
+                break
+            except Exception as e:
+                self.logger.error(f"价格脱离监控出错: {e}")
+                import traceback
+                self.logger.error(traceback.format_exc())
+                await asyncio.sleep(10)  # 出错后等待10秒再继续
+
+    async def _reset_grid_for_price_follow(self, current_price: Decimal, direction: str):
+        """
+        重置网格（价格移动网格专用）
+
+        Args:
+            current_price: 当前价格
+            direction: 脱离方向 ("up" 或 "down")
+        """
+        if self._is_resetting:
+            self.logger.warning("网格正在重置中，跳过本次重置")
+            return
+
+        # 🔒 检查是否应该锁定而不是重置
+        if self.price_lock_manager:
+            if self.price_lock_manager.should_lock_instead_of_reset(current_price, direction):
+                # 激活价格锁定，不执行重置
+                self.price_lock_manager.activate_lock(current_price)
+                self.logger.info(
+                    f"🔒 价格锁定已激活，不执行重置。"
+                    f"保留订单和持仓，等待价格回归..."
+                )
+                return
+
+        try:
+            self._is_resetting = True
+
+            self.logger.info(
+                f"🔄 开始重置网格: 当前价格=${current_price:,.2f}, 脱离方向={direction}"
+            )
+
+            # 判断是否需要平仓（价格朝有利方向脱离 = 止盈）
+            should_close_position = False
+            if self.config.is_long() and direction == "up":
+                # 做多 + 价格向上 = 盈利方向，需要平仓止盈
+                should_close_position = True
+                self.logger.info("📊 做多网格价格向上脱离 → 需要平仓止盈")
+            elif self.config.is_short() and direction == "down":
+                # 做空 + 价格向下 = 盈利方向，需要平仓止盈
+                should_close_position = True
+                self.logger.info("📊 做空网格价格向下脱离 → 需要平仓止盈")
+            else:
+                self.logger.info("📊 价格朝不利方向脱离 → 保留持仓")
+
+            # 1. 取消所有挂单
+            self.logger.info("📋 步骤 1/7: 取消所有挂单...")
+            cancelled_count = await self.engine.cancel_all_orders()
+            self.logger.info(f"批量取消API返回: {cancelled_count} 个订单")
+
+            # 2. 验证所有订单是否真的被取消（带重试机制）
+            self.logger.info("📋 步骤 2/7: 验证订单取消状态...")
+
+            max_retries = 3  # 最多重试3次
+            retry_delay = 2  # 每次重试间隔2秒
+
+            for retry in range(max_retries):
+                # 等待让交易所处理取消请求
+                if retry == 0:
+                    await asyncio.sleep(1)  # 首次验证等待1秒
+                else:
+                    await asyncio.sleep(retry_delay)  # 重试时等待2秒
+
+                # 获取当前未成交订单数量
+                open_orders = await self.engine.exchange.get_open_orders(self.config.symbol)
+                open_count = len(open_orders)
+
+                if open_count == 0:
+                    # 验证成功
+                    self.logger.info(f"✅ 订单取消验证通过: 当前未成交订单 {open_count} 个")
+                    break
+                else:
+                    # 验证失败
+                    if retry < max_retries - 1:
+                        # 还有重试机会，尝试再次取消
+                        self.logger.warning(
+                            f"⚠️ 第 {retry + 1} 次验证失败: 仍有 {open_count} 个未成交订单"
+                        )
+                        self.logger.info(f"🔄 尝试再次取消这些订单...")
+
+                        # 再次调用取消订单
+                        retry_cancelled = await self.engine.cancel_all_orders()
+                        self.logger.info(f"重试取消返回: {retry_cancelled} 个订单")
+                    else:
+                        # 已达到最大重试次数，放弃
+                        self.logger.error(
+                            f"❌ 订单取消验证最终失败！已重试 {max_retries} 次，仍有 {open_count} 个未成交订单"
+                        )
+                        self.logger.error(f"预期: 0 个订单, 实际: {open_count} 个订单")
+                        self.logger.error("⚠️ 网格重置已暂停，不会挂出新订单，避免超出订单限制")
+                        self.logger.error("💡 建议: 请手动检查交易所订单，或等待下次价格脱离时自动重试")
+
+                        # 不继续后续步骤，直接返回
+                        return
+
+            # 3. 平仓（如果需要）
+            new_capital = None  # 用于记录平仓后的新本金
+            if should_close_position:
+                current_position = self.tracker.get_current_position()
+                if current_position != 0:
+                    self.logger.info(
+                        f"📋 步骤 3/7: 价格脱离平仓止盈: {current_position:+.4f}")
+                    try:
+                        # 使用市价单平仓
+                        side = GridOrderSide.SELL if current_position > 0 else GridOrderSide.BUY
+                        await self.engine.place_market_order(
+                            side=side,
+                            amount=abs(current_position)
+                        )
+                        self.logger.info("✅ 价格脱离平仓完成")
+
+                        # 等待平仓完成并余额更新
+                        await asyncio.sleep(2)
+
+                        # 重新获取抵押品余额（平仓后的新本金）
+                        try:
+                            await self._update_account_balance()
+                            new_capital = self._collateral_balance
+                            self.logger.info(
+                                f"📊 价格脱离平仓后新本金: ${new_capital:,.3f}")
+                        except Exception as e:
+                            self.logger.error(f"⚠️ 获取平仓后余额失败: {e}")
+                    except Exception as e:
+                        self.logger.error(f"❌ 价格脱离平仓失败: {e}")
+                        # 即使平仓失败也继续重置流程
+                else:
+                    self.logger.info("📋 步骤 3/7: 无持仓，跳过平仓")
+            else:
+                self.logger.info("📋 步骤 3/7: 不利方向脱离，保留持仓")
+
+            # 4. 清空状态
+            self.logger.info("📋 步骤 4/7: 清空网格状态...")
+            self.state.active_orders.clear()
+            self.state.pending_buy_orders = 0
+            self.state.pending_sell_orders = 0
+            self.logger.info("✅ 网格状态已清空")
+
+            # 5. 更新价格区间
+            self.logger.info("📋 步骤 5/7: 更新价格区间...")
+            old_range = (self.config.lower_price, self.config.upper_price)
+            self.config.update_price_range_for_follow_mode(current_price)
+            self.logger.info(
+                f"✅ 价格区间已更新: "
+                f"[${old_range[0]:,.2f}, ${old_range[1]:,.2f}] → "
+                f"[${self.config.lower_price:,.2f}, ${self.config.upper_price:,.2f}]"
+            )
+
+            # 6. 重新初始化网格层级
+            self.logger.info("📋 步骤 6/7: 重新初始化网格层级...")
+            self.state.initialize_grid_levels(
+                self.config.grid_count,
+                self.config.get_grid_price
+            )
+            self.logger.info(f"✅ 网格层级已重新初始化，共{self.config.grid_count}个")
+
+            # 7. 生成并挂出新订单
+            self.logger.info("📋 步骤 7/7: 生成并挂出新订单...")
+            initial_orders = self.strategy.initialize(self.config)
+            placed_orders = await self.engine.place_batch_orders(initial_orders)
+
+            # 添加到状态
+            for order in placed_orders:
+                if order.order_id in self.state.active_orders:
+                    continue
+                if order.status == GridOrderStatus.FILLED:
+                    continue
+                self.state.add_order(order)
+
+            # 8. 如果平仓了，重新初始化本金
+            if new_capital is not None:
+                if self.capital_protection_manager:
+                    self.capital_protection_manager.initialize_capital(
+                        new_capital, is_reinit=True)
+                if self.take_profit_manager:
+                    self.take_profit_manager.initialize_capital(
+                        new_capital, is_reinit=True)
+                if self.scalping_manager:
+                    self.scalping_manager.initialize_capital(
+                        new_capital, is_reinit=True)
+                self.logger.info(f"💰 本金已重新初始化: ${new_capital:,.3f}")
+
+            self.logger.info(
+                f"✅ 网格重置完成！成功挂出 {len(placed_orders)} 个订单，"
+                f"新价格区间: [${self.config.lower_price:,.2f}, ${self.config.upper_price:,.2f}]"
+            )
+
+        except Exception as e:
+            self.logger.error(f"❌ 网格重置失败: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            self._handle_error(e)
+        finally:
+            self._is_resetting = False
+
+    # ===========================================
+    # 🔥 剥头皮模式相关方法
+    # ===========================================
+
+    async def _check_scalping_mode(self, current_price: Decimal, current_grid_index: int):
+        """
+        检查是否触发或退出剥头皮模式
+
+        Args:
+            current_price: 当前价格
+            current_grid_index: 当前网格索引
+        """
+        if not self.scalping_manager:
+            return
+
+        # 检查是否应该触发剥头皮
+        if self.scalping_manager.should_trigger(current_price, current_grid_index):
+            await self._activate_scalping_mode()
+
+        # 检查是否应该退出剥头皮
+        elif self.scalping_manager.should_exit(current_price, current_grid_index):
+            await self._deactivate_scalping_mode()
+
+    async def _verify_no_sell_orders_at_exchange(self, max_retries: int = 3) -> bool:
+        """
+        从交易所验证没有卖单（做多网格剥头皮模式）
+
+        Args:
+            max_retries: 最大重试次数
+
+        Returns:
+            True: 确认没有卖单
+            False: 仍有卖单
+        """
+        for retry in range(max_retries):
+            try:
+                # 从交易所获取当前挂单
+                exchange_orders = await self.engine.exchange.get_open_orders(
+                    symbol=self.config.symbol
+                )
+
+                # 过滤出卖单
+                sell_orders = [
+                    order for order in exchange_orders
+                    if order.side == GridOrderSide.SELL
+                ]
+
+                if len(sell_orders) == 0:
+                    self.logger.info(f"✅ 验证通过: 交易所确认无卖单")
+                    return True
+                else:
+                    self.logger.warning(
+                        f"⚠️ 验证失败 (尝试{retry+1}/{max_retries}): "
+                        f"交易所仍有{len(sell_orders)}个卖单"
+                    )
+                    for order in sell_orders:
+                        self.logger.warning(
+                            f"   残留卖单: {order.order_id}, "
+                            f"价格=${order.price}"
+                        )
+
+                    # 如果不是最后一次重试，等待后再验证
+                    if retry < max_retries - 1:
+                        await asyncio.sleep(0.5)
+
+            except Exception as e:
+                self.logger.error(f"验证卖单失败: {e}")
+                if retry < max_retries - 1:
+                    await asyncio.sleep(0.5)
+
+        return False
+
+    async def _verify_take_profit_order_placed(
+        self,
+        expected_order_id: str,
+        max_retries: int = 3
+    ) -> bool:
+        """
+        验证止盈订单已在交易所挂出
+
+        Args:
+            expected_order_id: 预期的订单ID
+            max_retries: 最大重试次数
+
+        Returns:
+            True: 订单已挂出
+            False: 订单未挂出
+        """
+        for retry in range(max_retries):
+            try:
+                # 从交易所获取当前挂单
+                exchange_orders = await self.engine.exchange.get_open_orders(
+                    symbol=self.config.symbol
+                )
+
+                # 查找止盈订单
+                found = False
+                for order in exchange_orders:
+                    if order.order_id == expected_order_id:
+                        found = True
+                        self.logger.info(
+                            f"✅ 验证通过: 止盈订单已挂出 "
+                            f"{order.side.value} {order.amount}@${order.price}"
+                        )
+                        break
+
+                if found:
+                    return True
+                else:
+                    self.logger.warning(
+                        f"⚠️ 验证失败 (尝试{retry+1}/{max_retries}): "
+                        f"交易所未找到订单 {expected_order_id}"
+                    )
+
+                    if retry < max_retries - 1:
+                        await asyncio.sleep(0.5)
+
+            except Exception as e:
+                self.logger.error(f"验证止盈订单失败: {e}")
+                if retry < max_retries - 1:
+                    await asyncio.sleep(0.5)
+
+        return False
+
+    async def _cancel_all_sell_orders_with_verification(self, max_attempts: int = 3) -> bool:
+        """
+        取消所有卖单，并验证成功
+
+        循环逻辑：
+        1. 批量取消卖单
+        2. 从交易所验证
+        3. 如果还有残留，再次批量取消
+        4. 重复最多max_attempts次
+
+        Args:
+            max_attempts: 最大尝试次数
+
+        Returns:
+            True: 所有卖单已取消
+            False: 仍有卖单无法取消
+        """
+        orders_to_cancel_type = "sell"
+
+        for attempt in range(max_attempts):
+            self.logger.info(
+                f"🔄 取消卖单尝试 {attempt+1}/{max_attempts}..."
+            )
+
+            # 1. 收集需要取消的卖单（从本地状态）
+            orders_to_cancel_list = []
+            for order_id, order in list(self.state.active_orders.items()):
+                if order.side == GridOrderSide.SELL:
+                    orders_to_cancel_list.append(order)
+
+            if len(orders_to_cancel_list) == 0:
+                self.logger.info("📋 本地状态显示无卖单，验证交易所...")
+                # 即使本地无卖单，也要验证交易所
+                if await self._verify_no_sell_orders_at_exchange():
+                    return True
+                else:
+                    # 交易所还有卖单，但本地状态没有，需要同步
+                    self.logger.warning("⚠️ 本地状态与交易所不同步，从交易所获取...")
+                    try:
+                        exchange_orders = await self.engine.exchange.get_open_orders(
+                            symbol=self.config.symbol
+                        )
+                        orders_to_cancel_list = [
+                            order for order in exchange_orders
+                            if order.side == GridOrderSide.SELL
+                        ]
+                    except Exception as e:
+                        self.logger.error(f"从交易所获取订单失败: {e}")
+                        continue
+
+            self.logger.info(f"📋 准备取消 {len(orders_to_cancel_list)} 个卖单")
+
+            # 2. 批量取消订单（并发，提高速度）
+            cancelled_count = 0
+            failed_count = 0
+
+            async def cancel_single_order(order):
+                """取消单个订单"""
+                try:
+                    await self.engine.cancel_order(order.order_id)
+                    self.state.remove_order(order.order_id)
+                    return True, order.order_id
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "not found" in error_msg or "does not exist" in error_msg:
+                        # 订单已不存在，从状态移除
+                        self.state.remove_order(order.order_id)
+                        return True, order.order_id
+                    else:
+                        return False, order.order_id
+
+            # 并发取消（限制批次大小避免API限流）
+            batch_size = 10
+            for i in range(0, len(orders_to_cancel_list), batch_size):
+                batch = orders_to_cancel_list[i:i+batch_size]
+                tasks = [cancel_single_order(order) for order in batch]
+
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=30.0
+                    )
+
+                    for result in results:
+                        if isinstance(result, Exception):
+                            failed_count += 1
+                        elif result[0]:
+                            cancelled_count += 1
+                        else:
+                            failed_count += 1
+
+                except Exception as e:
+                    self.logger.error(f"批量取消订单失败: {e}")
+                    failed_count += len(batch)
+
+                # 避免API限流
+                if i + batch_size < len(orders_to_cancel_list):
+                    await asyncio.sleep(0.1)
+
+            self.logger.info(
+                f"✅ 批量取消完成: 成功={cancelled_count}, 失败={failed_count}"
+            )
+
+            # 3. 等待一小段时间，让交易所处理取消请求
+            await asyncio.sleep(0.3)
+
+            # 4. 🔥 关键：从交易所验证是否还有卖单
+            if await self._verify_no_sell_orders_at_exchange():
+                self.logger.info(f"✅ 所有卖单已成功取消（尝试{attempt+1}次）")
+                return True
+            else:
+                self.logger.warning(
+                    f"⚠️ 交易所仍有卖单残留，准备第{attempt+2}次尝试..."
+                )
+                # 继续下一次循环
+
+        # 达到最大尝试次数，仍有卖单
+        self.logger.error(
+            f"❌ 取消卖单失败: 已尝试{max_attempts}次，交易所仍有卖单残留"
+        )
+        return False
+
+    async def _check_capital_protection_mode(self, current_price: Decimal, current_grid_index: int):
+        """
+        检查是否触发本金保护模式
+
+        Args:
+            current_price: 当前价格
+            current_grid_index: 当前网格索引
+        """
+        if not self.capital_protection_manager:
+            return
+
+        # 如果已经触发，检查是否回本
+        if self.capital_protection_manager.is_active():
+            # 检查抵押品是否回本
+            if self.capital_protection_manager.check_capital_recovery(self._collateral_balance):
+                self.logger.warning(
+                    f"🛡️ 本金保护：抵押品已回本，准备重置网格！"
+                )
+                await self._execute_capital_protection_reset()
+        else:
+            # 检查是否应该触发
+            if self.capital_protection_manager.should_trigger(current_price, current_grid_index):
+                self.capital_protection_manager.activate()
+                self.logger.warning(
+                    f"🛡️ 本金保护已激活！等待抵押品回本... "
+                    f"初始本金: ${self.capital_protection_manager.get_initial_capital():,.2f}"
+                )
+
+    async def _execute_capital_protection_reset(self):
+        """执行本金保护重置（平仓后重置并重新初始化本金）"""
+        try:
+            # 🔥 关键：设置重置标志，防止并发操作
+            self._resetting = True
+            self.logger.warning("🛡️ 开始执行本金保护重置（锁定系统）...")
+
+            # 1. 取消所有订单（带验证和重试机制）
+            self.logger.info("📋 步骤 1/5: 取消所有订单...")
+            try:
+                cancelled_count = await self.engine.cancel_all_orders()
+                self.logger.info(f"✅ 批量取消API返回: {cancelled_count} 个订单")
+            except Exception as e:
+                self.logger.error(f"❌ 批量取消订单失败: {e}")
+
+            # 2. 验证所有订单是否真的被取消（带重试机制）
+            self.logger.info("📋 步骤 2/5: 验证订单取消状态...")
+
+            max_retries = 3  # 最多重试3次
+            retry_delay = 1.5  # 每次重试间隔1.5秒
+            cancel_verified = False
+
+            for retry in range(max_retries):
+                # 等待让交易所处理取消请求
+                if retry == 0:
+                    await asyncio.sleep(0.8)  # 首次验证等待0.8秒
+                else:
+                    await asyncio.sleep(retry_delay)  # 重试时等待1.5秒
+
+                # 获取当前未成交订单
+                try:
+                    open_orders = await self.engine.exchange.get_open_orders(self.config.symbol)
+                    open_count = len(open_orders)
+
+                    if open_count == 0:
+                        # 验证成功
+                        self.logger.info(f"✅ 订单取消验证通过: 当前未成交订单 {open_count} 个")
+                        cancel_verified = True
+                        break
+                    else:
+                        # 验证失败
+                        if retry < max_retries - 1:
+                            # 还有重试机会，尝试再次取消
+                            self.logger.warning(
+                                f"⚠️ 第 {retry + 1} 次验证失败: 仍有 {open_count} 个未成交订单"
+                            )
+                            self.logger.info(f"🔄 尝试再次取消这些订单...")
+
+                            # 再次调用取消订单
+                            try:
+                                retry_cancelled = await self.engine.cancel_all_orders()
+                                self.logger.info(
+                                    f"重试取消返回: {retry_cancelled} 个订单")
+                            except Exception as e:
+                                self.logger.error(f"重试取消失败: {e}")
+                        else:
+                            # 已达到最大重试次数
+                            self.logger.error(
+                                f"❌ 订单取消验证最终失败！已重试 {max_retries} 次，仍有 {open_count} 个未成交订单"
+                            )
+                            self.logger.error(
+                                f"预期: 0 个订单, 实际: {open_count} 个订单")
+                            self.logger.error("⚠️ 本金保护重置已暂停，不会继续后续步骤")
+                            return  # 直接返回，不继续执行
+
+                except Exception as e:
+                    self.logger.error(f"验证订单状态失败: {e}")
+
+            # 仅在验证成功后才继续
+            if not cancel_verified:
+                self.logger.error("❌ 由于订单取消验证失败，本金保护重置已中止")
+                return
+
+            # 3. 平掉所有持仓
+            self.logger.info("📋 步骤 3/5: 平仓...")
+            current_position = self.tracker.get_current_position()
+            if current_position != 0:
+                self.logger.info(f"📊 本金保护平仓: {current_position:+.4f}")
+                try:
+                    # 使用市价单平仓
+                    side = GridOrderSide.SELL if current_position > 0 else GridOrderSide.BUY
+                    await self.engine.place_market_order(
+                        side=side,
+                        amount=abs(current_position)
+                    )
+                    self.logger.info("✅ 本金保护平仓完成")
+                except Exception as e:
+                    self.logger.error(f"❌ 本金保护平仓失败: {e}")
+                    # 即使平仓失败也继续重置流程
+
+            # 4. 等待一小段时间，让平仓完成并余额更新
+            await asyncio.sleep(2)
+
+            # 5. 重新获取抵押品余额（平仓后的新本金）
+            self.logger.info("📋 步骤 4/5: 获取新本金...")
+            try:
+                await self._update_account_balance()
+                new_capital = self._collateral_balance
+                self.logger.info(f"📊 本金保护后新本金: ${new_capital:,.3f}")
+            except Exception as e:
+                self.logger.error(f"⚠️ 获取平仓后余额失败: {e}")
+                new_capital = self._collateral_balance  # 使用当前值
+
+            # 6. 根据网格类型决定后续操作
+            self.logger.info("📋 步骤 5/5: 重新启动网格...")
+            if self.config.is_follow_mode():
+                # 价格移动网格：重置并重新启动（重新初始化本金）
+                # 注意：_reset_and_restart 内部也会取消订单并验证，但我们已经清理过了
+                # 所以这里需要跳过那部分，直接初始化
+                self.logger.info("🔄 价格移动网格：重置网格并重新启动...")
+                await self._reset_and_restart(new_capital=new_capital)
+                self.logger.info("✅ 本金保护重置完成，网格已重新启动")
+            else:
+                # 固定范围网格：停止运行
+                self.logger.info("⏹️ 固定范围网格：停止运行...")
+                await self.stop()
+                self.logger.warning("🛡️ 本金保护：固定范围网格已停止，请手动重新启动")
+
+        except Exception as e:
+            self.logger.error(f"❌ 本金保护重置失败: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+        finally:
+            # 🔥 关键：无论成功或失败，都要释放重置锁
+            self._resetting = False
+            self.logger.info("🔓 系统锁定已释放")
+
+    async def _execute_take_profit_reset(self):
+        """执行止盈重置（无论哪种网格都重置并重启）"""
+        try:
+            # 🔥 关键：设置重置标志，防止并发操作
+            self._resetting = True
+            self.logger.warning("💰 开始执行止盈重置（锁定系统）...")
+
+            # 1. 取消所有订单（带验证和重试机制）
+            self.logger.info("📋 步骤 1/5: 取消所有订单...")
+            try:
+                cancelled_count = await self.engine.cancel_all_orders()
+                self.logger.info(f"✅ 批量取消API返回: {cancelled_count} 个订单")
+            except Exception as e:
+                self.logger.error(f"❌ 批量取消订单失败: {e}")
+
+            # 2. 验证所有订单是否真的被取消（带重试机制）
+            self.logger.info("📋 步骤 2/5: 验证订单取消状态...")
+
+            max_retries = 3  # 最多重试3次
+            retry_delay = 1.5  # 每次重试间隔1.5秒
+            cancel_verified = False
+
+            for retry in range(max_retries):
+                # 等待让交易所处理取消请求
+                if retry == 0:
+                    await asyncio.sleep(0.8)  # 首次验证等待0.8秒
+                else:
+                    await asyncio.sleep(retry_delay)  # 重试时等待1.5秒
+
+                # 获取当前未成交订单
+                try:
+                    open_orders = await self.engine.exchange.get_open_orders(self.config.symbol)
+                    open_count = len(open_orders)
+
+                    if open_count == 0:
+                        # 验证成功
+                        self.logger.info(f"✅ 订单取消验证通过: 当前未成交订单 {open_count} 个")
+                        cancel_verified = True
+                        break
+                    else:
+                        # 验证失败
+                        if retry < max_retries - 1:
+                            # 还有重试机会，尝试再次取消
+                            self.logger.warning(
+                                f"⚠️ 第 {retry + 1} 次验证失败: 仍有 {open_count} 个未成交订单"
+                            )
+                            self.logger.info(f"🔄 尝试再次取消这些订单...")
+
+                            # 再次调用取消订单
+                            try:
+                                retry_cancelled = await self.engine.cancel_all_orders()
+                                self.logger.info(
+                                    f"重试取消返回: {retry_cancelled} 个订单")
+                            except Exception as e:
+                                self.logger.error(f"重试取消失败: {e}")
+                        else:
+                            # 已达到最大重试次数
+                            self.logger.error(
+                                f"❌ 订单取消验证最终失败！已重试 {max_retries} 次，仍有 {open_count} 个未成交订单"
+                            )
+                            self.logger.error(
+                                f"预期: 0 个订单, 实际: {open_count} 个订单")
+                            self.logger.error("⚠️ 止盈重置已暂停，不会继续后续步骤")
+                            return  # 直接返回，不继续执行
+
+                except Exception as e:
+                    self.logger.error(f"验证订单状态失败: {e}")
+
+            # 仅在验证成功后才继续
+            if not cancel_verified:
+                self.logger.error("❌ 由于订单取消验证失败，止盈重置已中止")
+                return
+
+            # 3. 平掉所有持仓
+            self.logger.info("📋 步骤 3/5: 平仓...")
+            current_position = self.tracker.get_current_position()
+            if current_position != 0:
+                self.logger.info(f"📊 止盈平仓: {current_position:+.4f}")
+                try:
+                    # 使用市价单平仓
+                    side = GridOrderSide.SELL if current_position > 0 else GridOrderSide.BUY
+                    await self.engine.place_market_order(
+                        side=side,
+                        amount=abs(current_position)
+                    )
+                    self.logger.info("✅ 止盈平仓完成")
+                except Exception as e:
+                    self.logger.error(f"❌ 止盈平仓失败: {e}")
+                    # 即使平仓失败也继续重置流程
+
+            # 4. 等待一小段时间，让平仓完成并余额更新
+            await asyncio.sleep(2)
+
+            # 5. 重新获取抵押品余额（止盈后的新本金）
+            self.logger.info("📋 步骤 4/5: 获取新本金...")
+            try:
+                await self._update_account_balance()
+                new_capital = self._collateral_balance
+                self.logger.info(f"📊 止盈后新本金: ${new_capital:,.3f}")
+            except Exception as e:
+                self.logger.error(f"⚠️ 获取止盈后余额失败: {e}")
+                new_capital = self._collateral_balance  # 使用当前值
+
+            # 6. 重置网格（价格移动网格和固定范围网格都重置）
+            self.logger.info("📋 步骤 5/5: 重新启动网格...")
+            if self.config.is_follow_mode():
+                # 价格移动网格：根据当前价格重新挂单
+                self.logger.info("🔄 价格移动网格：重置并重新启动...")
+                await self._reset_and_restart(new_capital=new_capital)
+                self.logger.info("✅ 止盈重置完成，价格移动网格已重启")
+            else:
+                # 固定范围网格：保持原有范围重新挂单
+                self.logger.info("🔄 固定范围网格：保持范围重新挂单...")
+                await self._reset_fixed_range_grid(new_capital=new_capital)
+                self.logger.info("✅ 止盈重置完成，固定范围网格已重启")
+
+        except Exception as e:
+            self.logger.error(f"❌ 止盈重置失败: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+        finally:
+            # 🔥 关键：无论成功或失败，都要释放重置锁
+            self._resetting = False
+            self.logger.info("🔓 系统锁定已释放")
+
+    async def _reset_and_restart(self, new_capital: Optional[Decimal] = None):
+        """重置并重新启动网格
+
+        Args:
+            new_capital: 新的初始本金（止盈后使用）
+        """
+        try:
+            self.logger.info("🔄 重置网格状态...")
+
+            # 🔥 关键修复：先取消所有订单（避免旧订单与新订单冲突）
+            self.logger.info("📋 步骤 1/7: 取消所有订单...")
+            cancelled_count = await self.engine.cancel_all_orders()
+            self.logger.info(f"✅ 批量取消API返回: {cancelled_count} 个订单")
+
+            # 🔥 验证所有订单是否真的被取消（带重试机制）
+            self.logger.info("📋 步骤 2/7: 验证订单取消状态...")
+
+            max_retries = 3  # 最多重试3次
+            retry_delay = 2  # 每次重试间隔2秒
+
+            for retry in range(max_retries):
+                # 等待让交易所处理取消请求
+                if retry == 0:
+                    await asyncio.sleep(1)  # 首次验证等待1秒
+                else:
+                    await asyncio.sleep(retry_delay)  # 重试时等待2秒
+
+                # 获取当前未成交订单数量
+                try:
+                    open_orders = await self.engine.exchange.get_open_orders(self.config.symbol)
+                    open_count = len(open_orders)
+
+                    if open_count == 0:
+                        # 验证成功
+                        self.logger.info(f"✅ 订单取消验证通过: 当前未成交订单 {open_count} 个")
+                        break
+                    else:
+                        # 验证失败
+                        if retry < max_retries - 1:
+                            # 还有重试机会，尝试再次取消
+                            self.logger.warning(
+                                f"⚠️ 第 {retry + 1} 次验证失败: 仍有 {open_count} 个未成交订单"
+                            )
+                            self.logger.info(f"🔄 尝试再次取消这些订单...")
+
+                            # 再次调用取消订单
+                            retry_cancelled = await self.engine.cancel_all_orders()
+                            self.logger.info(f"重试取消返回: {retry_cancelled} 个订单")
+                        else:
+                            # 已达最大重试次数
+                            self.logger.error(
+                                f"❌ 订单取消验证失败（已重试 {max_retries} 次）: "
+                                f"仍有 {open_count} 个未成交订单"
+                            )
+                            self.logger.warning("⚠️ 继续重置流程，但可能会遇到订单冲突...")
+                except Exception as e:
+                    self.logger.error(f"⚠️ 验证订单取消状态时出错: {e}")
+                    if retry == max_retries - 1:
+                        self.logger.warning("⚠️ 无法验证订单取消状态，继续重置流程...")
+                    break
+
+            self.logger.info("📋 步骤 3/7: 重置所有管理器状态...")
+
+            # 1. 重置所有管理器状态
+            if self.scalping_manager:
+                self.scalping_manager.reset()
+            if self.capital_protection_manager:
+                self.capital_protection_manager.reset()
+            if self.take_profit_manager:
+                self.take_profit_manager.reset()
+            if self.price_lock_manager:
+                self.price_lock_manager.reset()
+
+            # 2. 重置追踪器和状态
+            self.tracker.reset()
+            self.state.active_orders.clear()  # 清空所有活跃订单
+            self.state.pending_buy_orders = 0
+            self.state.pending_sell_orders = 0
+
+            # 3. 价格移动网格：更新价格区间
+            self.logger.info("📋 步骤 4/7: 更新价格区间...")
+            if self.config.is_follow_mode():
+                current_price = await self.engine.get_current_price()
+                self.config.update_price_range_for_follow_mode(current_price)
+                self.logger.info(
+                    f"🔄 价格移动网格：根据当前价格 ${current_price:,.2f} "
+                    f"重新设置价格区间 [${self.config.lower_price:,.2f}, ${self.config.upper_price:,.2f}]"
+                )
+
+            # 4. 重新初始化网格层级
+            self.logger.info("📋 步骤 5/7: 重新初始化网格层级...")
+            self.state.initialize_grid_levels(
+                self.config.grid_count,
+                self.config.get_grid_price
+            )
+
+            # 5. 生成并挂出新订单
+            self.logger.info("📋 步骤 6/7: 生成并挂出新订单...")
+            initial_orders = self.strategy.initialize(self.config)
+            self.logger.info(f"📋 生成 {len(initial_orders)} 个初始订单")
+
+            placed_orders = await self.engine.place_batch_orders(initial_orders)
+            self.logger.info(f"✅ 成功挂出 {len(placed_orders)} 个订单")
+
+            # 🔥 关键修复：等待一段时间，让立即成交的订单完成
+            await asyncio.sleep(2)
+
+            # 6. 添加到状态追踪（只添加未成交的订单）
+            self.logger.info("📋 步骤 7/7: 添加订单到状态追踪...")
+            # 问题：在重置期间成交的订单回调被跳过了，导致这些订单状态不准确
+            # 解决：查询引擎获取实际的挂单列表，只添加仍在挂单的订单
+            added_count = 0
+            skipped_filled = 0
+            skipped_exists = 0
+
+            try:
+                # 获取当前实际挂单（从引擎）
+                engine_pending_orders = self.engine.get_pending_orders()
+                engine_pending_ids = {
+                    order.order_id for order in engine_pending_orders}
+
+                for order in placed_orders:
+                    if order.order_id in self.state.active_orders:
+                        skipped_exists += 1
+                        continue
+                    # 🔥 关键：检查订单是否真的还在挂单中
+                    if order.order_id not in engine_pending_ids:
+                        self.logger.debug(f"订单 {order.order_id} 已成交或取消，跳过添加")
+                        skipped_filled += 1
+                        continue
+                    self.state.add_order(order)
+                    added_count += 1
+            except Exception as e:
+                self.logger.warning(f"⚠️ 无法从引擎获取挂单列表，使用订单状态判断: {e}")
+                # Fallback：使用订单自身的状态
+                for order in placed_orders:
+                    if order.order_id in self.state.active_orders:
+                        skipped_exists += 1
+                        continue
+                    if order.status == GridOrderStatus.FILLED:
+                        self.logger.debug(f"订单 {order.order_id} 立即成交，跳过添加")
+                        skipped_filled += 1
+                        continue
+                    self.state.add_order(order)
+                    added_count += 1
+
+            buy_count = len(
+                [o for o in self.state.active_orders.values() if o.side == GridOrderSide.BUY])
+            sell_count = len(
+                [o for o in self.state.active_orders.values() if o.side == GridOrderSide.SELL])
+            self.logger.info(
+                f"📊 订单添加详情: "
+                f"新增={added_count}, "
+                f"跳过(已成交)={skipped_filled}, "
+                f"跳过(已存在)={skipped_exists}"
+            )
+            self.logger.info(
+                f"📊 状态统计: "
+                f"买单={buy_count}, "
+                f"卖单={sell_count}, "
+                f"活跃订单={len(self.state.active_orders)}"
+            )
+
+            # 7. 重新初始化本金（止盈后）
+            if new_capital is not None:
+                if self.capital_protection_manager:
+                    self.capital_protection_manager.initialize_capital(
+                        new_capital, is_reinit=True)
+                if self.take_profit_manager:
+                    self.take_profit_manager.initialize_capital(
+                        new_capital, is_reinit=True)
+                if self.scalping_manager:
+                    self.scalping_manager.initialize_capital(
+                        new_capital, is_reinit=True)
+                self.logger.info(f"💰 本金已重新初始化: ${new_capital:,.3f}")
+            else:
+                self.logger.info("ℹ️  本金将在外部重新初始化（使用最新余额）")
+
+            self.logger.info("✅ 网格重置完成，继续运行")
+
+        except Exception as e:
+            self.logger.error(f"❌ 网格重置失败: {e}")
+            import traceback
+            self.logger.error(f"详细错误: {traceback.format_exc()}")
+            raise
+
+    async def _reset_fixed_range_grid(self, new_capital: Optional[Decimal] = None):
+        """重置固定范围网格（保持原有范围）
+
+        Args:
+            new_capital: 新的初始本金（止盈后使用）
+        """
+        try:
+            self.logger.info("🔄 重置固定范围网格（保持价格区间）...")
+
+            # 重置所有管理器状态
+            if self.scalping_manager:
+                self.scalping_manager.reset()
+            if self.capital_protection_manager:
+                self.capital_protection_manager.reset()
+            if self.take_profit_manager:
+                self.take_profit_manager.reset()
+
+            # 重置追踪器和状态
+            self.tracker.reset()
+            self.state.active_orders.clear()  # 清空所有活跃订单
+            self.state.pending_buy_orders = 0
+            self.state.pending_sell_orders = 0
+
+            # 重新初始化网格层级（保持原有价格区间）
+            self.state.initialize_grid_levels(
+                self.config.grid_count,
+                self.config.get_grid_price
+            )
+
+            # 生成并挂出新订单（使用原有价格范围）
+            self.logger.info(
+                f"🚀 重新初始化固定范围网格并挂单: "
+                f"${self.config.lower_price:,.2f} - ${self.config.upper_price:,.2f}"
+            )
+            initial_orders = self.strategy.initialize(self.config)
+            self.logger.info(f"📋 生成 {len(initial_orders)} 个初始订单")
+
+            placed_orders = await self.engine.place_batch_orders(initial_orders)
+            self.logger.info(f"✅ 成功挂出 {len(placed_orders)} 个订单")
+
+            # 🔥 关键修复：等待WebSocket处理立即成交的订单
+            await asyncio.sleep(2)
+
+            # 添加到状态追踪（只添加未成交的订单）
+            added_count = 0
+            skipped_filled = 0
+            skipped_exists = 0
+
+            try:
+                # 获取当前实际挂单（从引擎）
+                engine_pending_orders = self.engine.get_pending_orders()
+                engine_pending_ids = {
+                    order.order_id for order in engine_pending_orders}
+
+                for order in placed_orders:
+                    if order.order_id in self.state.active_orders:
+                        skipped_exists += 1
+                        continue
+                    # 🔥 关键：检查订单是否真的还在挂单中
+                    if order.order_id not in engine_pending_ids:
+                        self.logger.debug(f"订单 {order.order_id} 已成交或取消，跳过添加")
+                        skipped_filled += 1
+                        continue
+                    self.state.add_order(order)
+                    added_count += 1
+            except Exception as e:
+                self.logger.warning(f"⚠️ 无法从引擎获取挂单列表，使用订单状态判断: {e}")
+                # Fallback：使用订单自身的状态
+                for order in placed_orders:
+                    if order.order_id in self.state.active_orders:
+                        skipped_exists += 1
+                        continue
+                    if order.status == GridOrderStatus.FILLED:
+                        self.logger.debug(f"订单 {order.order_id} 立即成交，跳过添加")
+                        skipped_filled += 1
+                        continue
+                    self.state.add_order(order)
+                    added_count += 1
+
+            buy_count = len(
+                [o for o in self.state.active_orders.values() if o.side == GridOrderSide.BUY])
+            sell_count = len(
+                [o for o in self.state.active_orders.values() if o.side == GridOrderSide.SELL])
+            self.logger.info(
+                f"📊 订单添加详情: "
+                f"新增={added_count}, "
+                f"跳过(已成交)={skipped_filled}, "
+                f"跳过(已存在)={skipped_exists}"
+            )
+            self.logger.info(
+                f"📊 状态统计: "
+                f"买单={buy_count}, "
+                f"卖单={sell_count}, "
+                f"活跃订单={len(self.state.active_orders)}"
+            )
+
+            # 🔥 重新初始化本金（止盈后）
+            if new_capital is not None:
+                if self.capital_protection_manager:
+                    self.capital_protection_manager.initialize_capital(
+                        new_capital, is_reinit=True)
+                if self.take_profit_manager:
+                    self.take_profit_manager.initialize_capital(
+                        new_capital, is_reinit=True)
+                if self.scalping_manager:
+                    self.scalping_manager.initialize_capital(
+                        new_capital, is_reinit=True)
+                self.logger.info(f"💰 本金已重新初始化: ${new_capital:,.3f}")
+
+            self.logger.info("✅ 固定范围网格重置完成，继续运行")
+
+        except Exception as e:
+            self.logger.error(f"❌ 固定范围网格重置失败: {e}")
+            raise
+
+    async def _activate_scalping_mode(self):
+        """激活剥头皮模式（串行验证版）"""
+        self.logger.warning("🔴 正在激活剥头皮模式...")
+
+        # 1. 激活剥头皮管理器
+        self.scalping_manager.activate()
+
+        # 2. 🔥 取消所有卖单（带验证）- 使用新的验证方法
+        if not await self._cancel_all_sell_orders_with_verification(max_attempts=3):
+            self.logger.error("❌ 取消卖单失败，剥头皮激活中止")
+            self.scalping_manager.deactivate()
+            return
+
+        # 3. 🔥 混合策略获取实时持仓：WebSocket优先，REST API备用
+        self.logger.info("📊 正在获取实时持仓信息（WebSocket优先，REST API备用）...")
+
+        # 第一步：尝试从WebSocket缓存获取
+        position_data = await self.engine.get_real_time_position(self.config.symbol)
+        current_position = position_data['size']
+        average_cost = position_data['entry_price']
+        data_source = "WebSocket"
+
+        # 第二步：如果WebSocket缓存为空，使用REST API作为备用
+        if current_position == 0 and average_cost == 0:
+            self.logger.warning(
+                "⚠️ WebSocket持仓缓存为空（交易所未推送初始持仓），"
+                "使用REST API获取准确数据..."
+            )
+
+            try:
+                # 调用REST API获取持仓（准确但有延迟）
+                positions = await self.engine.exchange.get_positions(
+                    symbols=[self.config.symbol]
+                )
+
+                if positions and len(positions) > 0:
+                    position = positions[0]
+                    current_position = position.size or Decimal('0')
+                    average_cost = position.entry_price or Decimal('0')
+
+                    # 根据方向确定持仓符号
+                    if hasattr(position, 'side'):
+                        from ....adapters.exchanges import PositionSide
+                        if position.side == PositionSide.SHORT and current_position != 0:
+                            current_position = -current_position
+
+                    data_source = "REST API"
+
+                    # 同步到WebSocket缓存（供后续使用）
+                    if not hasattr(self.engine.exchange, '_position_cache'):
+                        self.engine.exchange._position_cache = {}
+                    self.engine.exchange._position_cache[self.config.symbol] = {
+                        'size': current_position,
+                        'entry_price': average_cost,
+                        'unrealized_pnl': position.unrealized_pnl or Decimal('0'),
+                        'side': 'Long' if current_position > 0 else 'Short',
+                        'timestamp': datetime.now()
+                    }
+
+                    self.logger.info(
+                        f"✅ REST API获取成功: {current_position} {self.config.symbol.split('_')[0]}, "
+                        f"成本=${average_cost:,.2f}，已同步到WebSocket缓存"
+                    )
+                else:
+                    self.logger.warning("⚠️ REST API返回空持仓")
+
+            except Exception as e:
+                self.logger.error(f"❌ REST API获取持仓失败: {e}")
+                import traceback
+                self.logger.error(traceback.format_exc())
+
+        self.logger.info(
+            f"📊 最终持仓（来源: {data_source}）: "
+            f"{current_position} {self.config.symbol.split('_')[0]}, "
+            f"平均成本: ${average_cost:,.2f}"
+        )
+
+        initial_capital = self.scalping_manager.get_initial_capital()
+        self.scalping_manager.update_position(
+            current_position, average_cost, initial_capital, self._collateral_balance)
+        self._last_ws_position_size = current_position
+        self._last_ws_position_price = average_cost
+
+        # 4. 🔥 挂止盈订单（带验证）
+        if not await self._place_take_profit_order_with_verification(max_attempts=3):
+            self.logger.error("❌ 挂止盈订单失败，但剥头皮模式已激活")
+            # 不中止流程，继续运行
+
+        # 5. 🔥 注册WebSocket持仓更新回调（事件驱动，不再轮询）
+        if not hasattr(self.engine.exchange, '_position_callbacks'):
+            self.engine.exchange._position_callbacks = []
+        if self._on_position_update_from_ws not in self.engine.exchange._position_callbacks:
+            self.engine.exchange._position_callbacks.append(
+                self._on_position_update_from_ws)
+            self.logger.info("✅ 已注册WebSocket持仓更新回调（事件驱动）")
+
+        self.logger.warning("✅ 剥头皮模式已激活")
+
+    async def _deactivate_scalping_mode(self):
+        """退出剥头皮模式，恢复正常网格"""
+        self.logger.info("🟢 正在退出剥头皮模式...")
+
+        # 1. 🔥 移除WebSocket持仓更新回调
+        if hasattr(self.engine.exchange, '_position_callbacks'):
+            if self._on_position_update_from_ws in self.engine.exchange._position_callbacks:
+                self.engine.exchange._position_callbacks.remove(
+                    self._on_position_update_from_ws)
+                self.logger.info("✅ 已移除WebSocket持仓更新回调")
+
+        # 2. 停用剥头皮管理器（先停用，避免干扰）
+        self.scalping_manager.deactivate()
+
+        # 3. 取消所有订单（包括止盈订单和反向订单）
+        self.logger.info("📋 步骤 1/3: 取消所有订单...")
+        try:
+            cancelled_count = await self.engine.cancel_all_orders()
+            self.logger.info(f"✅ 批量取消API返回: {cancelled_count} 个订单")
+        except Exception as e:
+            self.logger.error(f"❌ 批量取消订单失败: {e}")
+
+        # 4. 验证所有订单是否真的被取消（带重试机制）
+        self.logger.info("📋 步骤 2/3: 验证订单取消状态...")
+
+        max_retries = 3  # 最多重试3次
+        retry_delay = 1.5  # 每次重试间隔1.5秒
+        cancel_verified = False
+
+        for retry in range(max_retries):
+            # 等待让交易所处理取消请求
+            if retry == 0:
+                await asyncio.sleep(0.8)  # 首次验证等待0.8秒
+            else:
+                await asyncio.sleep(retry_delay)  # 重试时等待1.5秒
+
+            # 获取当前未成交订单
+            try:
+                open_orders = await self.engine.exchange.get_open_orders(self.config.symbol)
+                open_count = len(open_orders)
+
+                if open_count == 0:
+                    # 验证成功
+                    self.logger.info(f"✅ 订单取消验证通过: 当前未成交订单 {open_count} 个")
+                    cancel_verified = True
+                    break
+                else:
+                    # 验证失败
+                    if retry < max_retries - 1:
+                        # 还有重试机会，尝试再次取消
+                        self.logger.warning(
+                            f"⚠️ 第 {retry + 1} 次验证失败: 仍有 {open_count} 个未成交订单"
+                        )
+                        self.logger.info(f"🔄 尝试再次取消这些订单...")
+
+                        # 再次调用取消订单
+                        try:
+                            retry_cancelled = await self.engine.cancel_all_orders()
+                            self.logger.info(f"重试取消返回: {retry_cancelled} 个订单")
+                        except Exception as e:
+                            self.logger.error(f"重试取消失败: {e}")
+                    else:
+                        # 已达到最大重试次数
+                        self.logger.error(
+                            f"❌ 订单取消验证最终失败！已重试 {max_retries} 次，仍有 {open_count} 个未成交订单"
+                        )
+                        self.logger.error(f"预期: 0 个订单, 实际: {open_count} 个订单")
+                        self.logger.error("⚠️ 恢复正常网格已暂停，不会挂出新订单，避免超出订单限制")
+                        self.logger.error("💡 建议: 请手动检查交易所订单")
+
+            except Exception as e:
+                self.logger.error(f"验证订单状态失败: {e}")
+
+        # 5. 仅在验证成功后才恢复正常网格
+        if cancel_verified:
+            self.logger.info("📋 步骤 3/3: 恢复正常网格模式，重新挂单...")
+
+            try:
+                # 重新生成所有网格订单
+                initial_orders = self.strategy.initialize(self.config)
+
+                # 批量挂单
+                placed_orders = await self.engine.place_batch_orders(initial_orders)
+
+                # 更新状态
+                for order in placed_orders:
+                    if order.order_id not in self.state.active_orders:
+                        self.state.add_order(order)
+
+                self.logger.info(f"✅ 已恢复正常网格，挂出 {len(placed_orders)} 个订单")
+
+            except Exception as e:
+                self.logger.error(f"❌ 恢复正常网格失败: {e}")
+        else:
+            self.logger.error("❌ 由于订单取消验证失败，跳过恢复正常网格步骤")
+            self.logger.error("💡 剥头皮模式已停用，但网格未恢复，系统处于暂停状态")
+
+    async def _place_take_profit_order(self):
+        """挂止盈订单"""
+        if not self.scalping_manager or not self.scalping_manager.is_active():
+            return
+
+        # 获取当前价格
+        current_price = await self.engine.get_current_price()
+
+        # 计算止盈订单
+        tp_order = self.scalping_manager.calculate_take_profit_order(
+            current_price)
+
+        if not tp_order:
+            self.logger.info("📋 当前无持仓，不挂止盈订单")
+            return
+
+        try:
+            # 下止盈订单
+            placed_order = await self.engine.place_order(tp_order)
+            self.state.add_order(placed_order)
+
+            self.logger.info(
+                f"💰 止盈订单已挂: {placed_order.side.value} "
+                f"{placed_order.amount}@{placed_order.price} "
+                f"(Grid {placed_order.grid_id})"
+            )
+        except Exception as e:
+            self.logger.error(f"❌ 挂止盈订单失败: {e}")
+
+    async def _place_take_profit_order_with_verification(self, max_attempts: int = 3) -> bool:
+        """
+        挂止盈订单，并验证成功
+
+        循环逻辑：
+        1. 挂止盈订单
+        2. 从交易所验证订单已挂出
+        3. 如果未挂出，重新挂
+        4. 重复最多max_attempts次
+
+        Args:
+            max_attempts: 最大尝试次数
+
+        Returns:
+            True: 止盈订单已挂出
+            False: 挂单失败
+        """
+        if not self.scalping_manager or not self.scalping_manager.is_active():
+            return False
+
+        for attempt in range(max_attempts):
+            self.logger.info(
+                f"🔄 挂止盈订单尝试 {attempt+1}/{max_attempts}..."
+            )
+
+            # 1. 获取当前价格
+            try:
+                current_price = await self.engine.get_current_price()
+            except Exception as e:
+                self.logger.error(f"获取当前价格失败: {e}")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(0.5)
+                continue
+
+            # 2. 计算止盈订单
+            tp_order = self.scalping_manager.calculate_take_profit_order(
+                current_price)
+
+            if not tp_order:
+                self.logger.info("📋 当前无持仓，无需挂止盈订单")
+                return True  # 无持仓视为成功
+
+            # 3. 挂止盈订单
+            try:
+                placed_order = await self.engine.place_order(tp_order)
+                self.state.add_order(placed_order)
+
+                self.logger.info(
+                    f"💰 止盈订单已提交: {placed_order.side.value} "
+                    f"{placed_order.amount}@${placed_order.price} "
+                    f"(Grid {placed_order.grid_id})"
+                )
+
+                # 4. 等待一小段时间，让交易所处理挂单请求
+                await asyncio.sleep(0.3)
+
+                # 5. 🔥 关键：从交易所验证订单已挂出
+                if await self._verify_take_profit_order_placed(placed_order.order_id):
+                    self.logger.info(f"✅ 止盈订单挂出成功（尝试{attempt+1}次）")
+                    return True
+                else:
+                    self.logger.warning(
+                        f"⚠️ 止盈订单未在交易所找到，准备第{attempt+2}次尝试..."
+                    )
+                    # 从本地状态移除，准备重试
+                    self.state.remove_order(placed_order.order_id)
+
+            except Exception as e:
+                self.logger.error(f"挂止盈订单失败: {e}")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(0.5)
+
+        # 达到最大尝试次数，挂单仍失败
+        self.logger.error(
+            f"❌ 挂止盈订单失败: 已尝试{max_attempts}次"
+        )
+        return False
+
+    async def _update_take_profit_order_if_needed(self):
+        """如果持仓变化，更新止盈订单（带验证）"""
+        if not self.scalping_manager or not self.scalping_manager.is_active():
+            return
+
+        current_position = self.tracker.get_current_position()
+
+        # 检查止盈订单是否需要更新
+        if not self.scalping_manager.is_take_profit_order_outdated(current_position):
+            return
+
+        self.logger.info("📋 持仓变化，更新止盈订单...")
+
+        # 🔥 1. 取消旧止盈订单（带验证）
+        old_tp_order = self.scalping_manager.get_current_take_profit_order()
+        if old_tp_order:
+            max_cancel_attempts = 3
+            cancel_success = False
+
+            for attempt in range(max_cancel_attempts):
+                try:
+                    await self.engine.cancel_order(old_tp_order.order_id)
+                    self.state.remove_order(old_tp_order.order_id)
+                    self.logger.info(f"✅ 已取消旧止盈订单: {old_tp_order.order_id}")
+
+                    # 等待取消完成
+                    await asyncio.sleep(0.3)
+
+                    # 🔥 验证订单已取消（从交易所查询）
+                    try:
+                        exchange_orders = await self.engine.exchange.get_open_orders(
+                            symbol=self.config.symbol
+                        )
+                        found = any(
+                            order.order_id == old_tp_order.order_id
+                            for order in exchange_orders
+                        )
+
+                        if not found:
+                            self.logger.info("✅ 验证通过: 旧止盈订单已取消")
+                            cancel_success = True
+                            break
+                        else:
+                            self.logger.warning(
+                                f"⚠️ 验证失败 (尝试{attempt+1}/{max_cancel_attempts}): "
+                                f"订单仍存在，重新取消..."
+                            )
+
+                    except Exception as e:
+                        self.logger.error(f"验证取消失败: {e}")
+
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "not found" in error_msg or "does not exist" in error_msg:
+                        self.logger.info("订单已不存在，视为取消成功")
+                        cancel_success = True
+                        break
+                    else:
+                        self.logger.error(f"取消旧止盈订单失败: {e}")
+
+            if not cancel_success:
+                self.logger.error("❌ 取消旧止盈订单失败，中止更新")
+                return
+
+        # 🔥 2. 挂新止盈订单（带验证）
+        if not await self._place_take_profit_order_with_verification(max_attempts=3):
+            self.logger.error("❌ 挂新止盈订单失败")
+        else:
+            self.logger.info("✅ 止盈订单已更新")
+
+    def _is_take_profit_order_filled(self, filled_order: GridOrder) -> bool:
+        """判断是否是止盈订单成交"""
+        if not self.scalping_manager or not self.scalping_manager.is_active():
+            return False
+
+        tp_order = self.scalping_manager.get_current_take_profit_order()
+        if not tp_order:
+            return False
+
+        return filled_order.order_id == tp_order.order_id
+
+    async def _handle_take_profit_filled(self):
+        """处理剥头皮止盈订单成交（持仓已平仓，需要重置网格并重新初始化本金）"""
+        try:
+            # 🔥 关键：设置重置标志，防止并发操作
+            self._resetting = True
+            self.logger.warning("🎯 剥头皮止盈订单已成交！（锁定系统）")
+
+            # 等待一小段时间，让平仓完成并余额更新
+            await asyncio.sleep(2)
+
+            # 根据网格类型决定后续行为
+            if self.config.is_follow_mode():
+                # 跟随移动网格：重置并重启（重新初始化本金）
+                self.logger.info("🔄 跟随移动网格模式：准备重置并重启...")
+
+                # 🔥 修复：在重置后再获取最新余额作为新本金
+                # 不在重置前获取，因为重置过程中余额可能会变化
+                await self._reset_and_restart(new_capital=None)
+
+                # 重置完成后，获取最新余额作为新本金
+                try:
+                    await self._update_account_balance()
+                    new_capital = self._collateral_balance
+                    self.logger.info(f"📊 重置后最新本金: ${new_capital:,.3f}")
+
+                    # 重新初始化所有管理器的本金
+                    if self.capital_protection_manager:
+                        self.capital_protection_manager.initialize_capital(
+                            new_capital, is_reinit=True)
+                    if self.take_profit_manager:
+                        self.take_profit_manager.initialize_capital(
+                            new_capital, is_reinit=True)
+                    if self.scalping_manager:
+                        self.scalping_manager.initialize_capital(
+                            new_capital, is_reinit=True)
+
+                    self.logger.info(f"💰 所有管理器本金已更新为最新余额: ${new_capital:,.3f}")
+                except Exception as e:
+                    self.logger.error(f"⚠️ 获取最新余额失败: {e}")
+
+                self.logger.info("✅ 剥头皮重置完成，价格移动网格已重启")
+            else:
+                # 普通/马丁网格：停止系统
+                self.logger.info("⏸️  普通/马丁网格模式：停止系统")
+                await self.stop()
+        finally:
+            # 🔥 关键：无论成功或失败，都要释放重置锁
+            self._resetting = False
+            self.logger.info("🔓 系统锁定已释放")
+
+    def _should_place_reverse_order_in_scalping(self, filled_order: GridOrder) -> bool:
+        """
+        判断在剥头皮模式下是否应该挂反向订单
+
+        Args:
+            filled_order: 已成交订单
+
+        Returns:
+            是否应该挂反向订单
+        """
+        from ..models import GridType
+
+        # 做多网格：只挂买单（建仓），不挂卖单（平仓）
+        if self.config.grid_type in [GridType.LONG, GridType.FOLLOW_LONG, GridType.MARTINGALE_LONG]:
+            # 如果成交的是买单，应该挂卖单，但剥头皮模式不挂
+            return filled_order.side == GridOrderSide.SELL
+
+        # 做空网格：只挂卖单（建仓），不挂买单（平仓）
+        else:
+            # 如果成交的是卖单，应该挂买单，但剥头皮模式不挂
+            return filled_order.side == GridOrderSide.BUY
+
+    def _sync_orders_from_engine(self):
+        """
+        从engine同步最新的订单统计到state
+
+        健康检查后，engine的_pending_orders可能已更新，需要同步到state
+        这样UI才能显示正确的订单数量
+
+        🔥 修复：同时同步state.active_orders，确保订单成交时能正确更新统计
+        """
+        try:
+            # 从engine获取当前挂单
+            engine_orders = self.engine.get_pending_orders()
+
+            # 统计买单和卖单数量
+            buy_count = sum(
+                1 for order in engine_orders if order.side == GridOrderSide.BUY)
+            sell_count = sum(
+                1 for order in engine_orders if order.side == GridOrderSide.SELL)
+
+            # 更新state的统计数据
+            self.state.pending_buy_orders = buy_count
+            self.state.pending_sell_orders = sell_count
+
+            # 🔥 新增：同步state.active_orders
+            # 确保state.active_orders包含所有engine中的订单
+            engine_order_ids = {order.order_id for order in engine_orders}
+            state_order_ids = set(self.state.active_orders.keys())
+
+            # 1. 移除state中已不存在于engine的订单
+            removed_orders = state_order_ids - engine_order_ids
+            for order_id in removed_orders:
+                if order_id in self.state.active_orders:
+                    del self.state.active_orders[order_id]
+
+            # 2. 添加engine中存在但state中没有的订单（健康检查新增的）
+            added_orders = engine_order_ids - state_order_ids
+            for order in engine_orders:
+                if order.order_id in added_orders:
+                    # 添加到state.active_orders，这样成交时能正确更新统计
+                    self.state.active_orders[order.order_id] = order
+
+            # 记录同步信息
+            if removed_orders or added_orders:
+                self.logger.debug(
+                    f"📊 订单同步: State增加{len(added_orders)}个, 移除{len(removed_orders)}个, "
+                    f"当前={len(self.state.active_orders)}个"
+                )
+
+            # 如果engine和state的订单数量差异较大，记录日志
+            state_total = len(self.state.active_orders)
+            engine_total = len(engine_orders)
+
+            if abs(state_total - engine_total) > 5:
+                self.logger.warning(
+                    f"⚠️ 订单同步后仍有差异: State={state_total}个, Engine={engine_total}个, "
+                    f"差异={abs(state_total - engine_total)}个"
+                )
+
+        except Exception as e:
+            self.logger.debug(f"同步订单统计失败: {e}")
+
+    async def _balance_monitor_loop(self):
+        """
+        账户余额监控循环
+
+        定期调用REST API查询账户余额（USDC）
+        """
+        self.logger.info("💰 账户余额监控循环已启动")
+
+        while self._running:
+            try:
+                await self._update_account_balance()
+                await asyncio.sleep(self._balance_update_interval)
+            except asyncio.CancelledError:
+                self.logger.info("💰 余额监控循环被取消")
+                break
+            except Exception as e:
+                self.logger.error(f"❌ 余额更新失败: {e}")
+                await asyncio.sleep(self._balance_update_interval)
+
+    async def _update_account_balance(self):
+        """
+        更新账户余额
+
+        从 Backpack collateral API 获取USDC余额
+        - spot_balance: availableQuantity（现货余额，未用作保证金）
+        - collateral_balance: lendQuantity（抵押品余额，用作保证金）
+        - order_locked_balance: openOrderQuantity（订单冻结余额）
+        """
+        try:
+            # 调用交易所API获取所有余额
+            balances = await self.engine.exchange.get_balances()
+
+            # 查找USDC余额
+            usdc_balance = None
+            for balance in balances:
+                if balance.currency.upper() == 'USDC':
+                    usdc_balance = balance
+                    break
+
+            if usdc_balance:
+                # 🔥 从 raw_data 中提取详细的余额信息
+                raw_data = usdc_balance.raw_data
+
+                # availableQuantity = 现货余额（未用作保证金的）
+                self._spot_balance = self._safe_decimal(
+                    raw_data.get('availableQuantity', '0'))
+
+                # lendQuantity = 抵押品余额（用作保证金的）
+                self._collateral_balance = self._safe_decimal(
+                    raw_data.get('lendQuantity', '0'))
+
+                # openOrderQuantity = 订单冻结余额
+                self._order_locked_balance = self._safe_decimal(
+                    raw_data.get('openOrderQuantity', '0'))
+
+                self._last_balance_update = datetime.now()
+
+                # 🛡️ 如果启用了本金保护，记录初始本金（首次获取）
+                if self.capital_protection_manager:
+                    if self.capital_protection_manager.get_initial_capital() == Decimal('0'):
+                        self.capital_protection_manager.initialize_capital(
+                            self._collateral_balance)
+
+                # 💰 如果启用了止盈模式，记录/更新初始本金
+                if self.take_profit_manager:
+                    if self.take_profit_manager.get_initial_capital() == Decimal('0'):
+                        # 首次初始化
+                        self.take_profit_manager.initialize_capital(
+                            self._collateral_balance, is_reinit=False)
+
+                # 🔴 如果启用了剥头皮，记录初始本金（首次获取）
+                if self.scalping_manager:
+                    if self.scalping_manager.get_initial_capital() == Decimal('0'):
+                        self.scalping_manager.initialize_capital(
+                            self._collateral_balance)
+                    else:
+                        # 已有本金，检查是否满足止盈条件
+                        if self.take_profit_manager.check_take_profit_condition(self._collateral_balance):
+                            # 触发止盈
+                            self.take_profit_manager.activate(
+                                self._collateral_balance)
+                            await self._execute_take_profit_reset()
+
+                self.logger.info(
+                    f"💰 余额已更新: 现货=${self._spot_balance:,.2f}, "
+                    f"抵押品=${self._collateral_balance:,.2f}, "
+                    f"订单冻结=${self._order_locked_balance:,.2f}"
+                )
+            else:
+                all_currencies = [b.currency for b in balances]
+                self.logger.warning(
+                    f"⚠️ 未找到USDC余额，所有币种: {', '.join(all_currencies) if all_currencies else '(空)'}"
+                )
+
+        except Exception as e:
+            self.logger.error(f"❌ 获取账户余额失败: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+
+    def _safe_decimal(self, value, default='0') -> Decimal:
+        """安全转换为Decimal"""
+        try:
+            if value is None:
+                return Decimal(default)
+            return Decimal(str(value))
+        except:
+            return Decimal(default)

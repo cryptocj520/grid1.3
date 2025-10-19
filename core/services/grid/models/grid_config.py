@@ -71,6 +71,13 @@ class GridConfig:
     follow_grid_count: Optional[int] = None         # 价格移动网格数量（用户指定）
     follow_timeout: int = 300                       # 脱离超时时间（秒，默认5分钟）
     follow_distance: int = 1                        # 脱离距离（网格数，默认1格）
+    price_offset_grids: int = 0                     # 价格偏移网格数（默认0，即以当前价格为边界）
+    # 说明：用于调整网格启动时的价格边界位置
+    # - 默认值0：以当前价格为边界（旧行为）
+    # - 做多网格：当前价格 + offset格 = 上边界，然后向下计算下边界
+    # - 做空网格：当前价格 - offset格 = 下边界，然后向上计算上边界
+    # - 效果：当前价格在网格内部，可立即触发交易
+    # - 推荐值：3-10格（让当前价格处于网格内部靠近边界的位置）
 
     # 剥头皮模式参数（可选）
     scalping_enabled: bool = False                   # 是否启用剥头皮模式
@@ -279,6 +286,10 @@ class GridConfig:
             特殊逻辑（price_lock_start_at_threshold=True时）：
             - 做多：如果当前价格 > 阈值，使用阈值为上限
             - 做空：如果当前价格 < 阈值，使用阈值为下限
+
+            价格偏移逻辑（price_offset_grids > 0时）：
+            - 做多：当前价格 + offset格 = 上限，让当前价格处于网格内部
+            - 做空：当前价格 - offset格 = 下限，让当前价格处于网格内部
         """
         if not self.is_follow_mode():
             return
@@ -299,8 +310,19 @@ class GridConfig:
                 # 使用当前价格作为上限（默认行为）
                 base_price = current_price
 
-            self.upper_price = base_price
-            self.lower_price = base_price - \
+            # 🆕 应用价格偏移（做多：向上偏移）
+            if self.price_offset_grids > 0:
+                offset_amount = self.grid_interval * self.price_offset_grids
+                self.upper_price = base_price + offset_amount
+                self.logger.info(
+                    f"📊 做多网格: 应用价格偏移 +{self.price_offset_grids}格 "
+                    f"(${offset_amount:,.4f}), "
+                    f"上边界 ${base_price:,.2f} → ${self.upper_price:,.2f}"
+                )
+            else:
+                self.upper_price = base_price
+
+            self.lower_price = self.upper_price - \
                 (self.grid_count * self.grid_interval)
 
         elif self.grid_type == GridType.FOLLOW_SHORT:
@@ -319,8 +341,19 @@ class GridConfig:
                 # 使用当前价格作为下限（默认行为）
                 base_price = current_price
 
-            self.lower_price = base_price
-            self.upper_price = base_price + \
+            # 🆕 应用价格偏移（做空：向下偏移）
+            if self.price_offset_grids > 0:
+                offset_amount = self.grid_interval * self.price_offset_grids
+                self.lower_price = base_price - offset_amount
+                self.logger.info(
+                    f"📊 做空网格: 应用价格偏移 -{self.price_offset_grids}格 "
+                    f"(${offset_amount:,.4f}), "
+                    f"下边界 ${base_price:,.2f} → ${self.lower_price:,.2f}"
+                )
+            else:
+                self.lower_price = base_price
+
+            self.upper_price = self.lower_price + \
                 (self.grid_count * self.grid_interval)
 
     def check_price_escape(self, current_price: Decimal) -> tuple[bool, str]:

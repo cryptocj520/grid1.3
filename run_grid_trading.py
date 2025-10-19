@@ -74,6 +74,8 @@ def create_grid_config(config_data: dict) -> GridConfig:
         'order_health_check_interval': grid_config.get('order_health_check_interval', 600),
         # 默认万分之1
         'fee_rate': Decimal(str(grid_config.get('fee_rate', '0.0001'))),
+        # 🔥 数量精度参数（重要！不同代币精度不同）
+        'quantity_precision': int(grid_config.get('quantity_precision', 3)),
     }
 
     # 🔥 价格移动网格：使用 follow_grid_count
@@ -81,6 +83,8 @@ def create_grid_config(config_data: dict) -> GridConfig:
         params['follow_grid_count'] = grid_config['follow_grid_count']
         params['follow_timeout'] = grid_config.get('follow_timeout', 300)
         params['follow_distance'] = grid_config.get('follow_distance', 1)
+        params['price_offset_grids'] = grid_config.get(
+            'price_offset_grids', 0)  # 🆕 价格偏移网格数
         # lower_price 和 upper_price 保持默认值 None
     else:
         # 普通网格和马丁网格：从 price_range 读取

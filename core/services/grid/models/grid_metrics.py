@@ -102,6 +102,12 @@ class GridStatistics:
     price_lock_active: bool = False            # 价格锁定是否已激活
     price_lock_threshold: Decimal = Decimal('0')  # 价格锁定阈值
 
+    # 🆕 触发次数统计（仅标记次数，无实质性功能）
+    scalping_trigger_count: int = 0            # 剥头皮模式触发次数
+    price_escape_trigger_count: int = 0        # 价格朝有利方向脱离触发次数
+    take_profit_trigger_count: int = 0         # 止盈模式触发次数
+    capital_protection_trigger_count: int = 0  # 本金保护模式触发次数
+
     def to_display_dict(self) -> Dict:
         """转换为显示字典"""
         return {

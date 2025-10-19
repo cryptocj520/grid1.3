@@ -65,7 +65,7 @@ class GridTerminalUI:
 
         title = Text()
         title.append("🎯 网格交易系统实时监控 ", style="bold cyan")
-        title.append("v1.3", style="bold magenta")
+        title.append("v2.2", style="bold magenta")
         title.append(" - ", style="bold white")
         title.append(
             f"{self.coordinator.config.exchange.upper()}/", style="bold yellow")
@@ -132,6 +132,10 @@ class GridTerminalUI:
                 content.append("🔴 已激活", style="bold red")
             else:
                 content.append("⚪ 待触发", style="bold cyan")
+            # 🆕 显示触发次数（从启动就显示，包括0次）
+            content.append(f"  |  触发次数: ", style="white")
+            content.append(f"{stats.scalping_trigger_count}",
+                           style="bold yellow")
             content.append("\n")
 
         # 🛡️ 显示本金保护模式状态
@@ -141,6 +145,10 @@ class GridTerminalUI:
                 content.append("🟢 已触发", style="bold green")
             else:
                 content.append("⚪ 待触发", style="bold cyan")
+            # 🆕 显示触发次数（从启动就显示，包括0次）
+            content.append(f"  |  触发次数: ", style="white")
+            content.append(
+                f"{stats.capital_protection_trigger_count}", style="bold yellow")
             content.append("\n")
 
         # 💰 显示止盈模式状态
@@ -159,6 +167,10 @@ class GridTerminalUI:
                 else:
                     content.append(
                         f"当前: {profit_rate:.2f}%  阈值: {threshold:.2f}%", style="bold red")
+            # 🆕 显示触发次数（从启动就显示，包括0次）
+            content.append(f"  |  触发次数: ", style="white")
+            content.append(
+                f"{stats.take_profit_trigger_count}", style="bold yellow")
             content.append("\n")
 
         # 🔒 显示价格锁定模式状态
@@ -181,6 +193,18 @@ class GridTerminalUI:
             content.append(f"{direction_text} ", style="bold yellow")
             content.append(
                 f"⏱️ {stats.price_escape_remaining}s", style="bold red")
+            # 🆕 显示触发次数（从启动就显示，包括0次）
+            content.append(f"  |  触发次数: ", style="white")
+            content.append(
+                f"{stats.price_escape_trigger_count}", style="bold yellow")
+            content.append("\n")
+        # 🆕 即使没有脱离，如果是价格移动网格，也显示历史触发次数
+        elif self.coordinator.config.is_follow_mode():
+            content.append("├─ 价格脱离: ", style="white")
+            content.append("✅ 正常  ", style="bold green")
+            content.append(f"|  历史触发次数: ", style="white")
+            content.append(
+                f"{stats.price_escape_trigger_count}", style="bold yellow")
             content.append("\n")
 
         content.append(

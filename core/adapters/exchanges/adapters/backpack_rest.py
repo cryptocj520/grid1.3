@@ -867,6 +867,21 @@ class BackpackRest(BackpackBase):
                     free = available_quantity
                     used = lend_quantity + open_order_quantity
 
+                    # 🔥 将顶层账户字段附加到 raw_data，便于后续使用
+                    # 这样每个币种的余额都能访问账户级别的数据
+                    raw_data_with_account_info = {
+                        **item,  # 币种自己的数据
+                        # 附加账户级别的顶层字段
+                        '_account_netEquityAvailable': data.get('netEquityAvailable', '0'),
+                        '_account_netEquity': data.get('netEquity', '0'),
+                        '_account_netEquityLocked': data.get('netEquityLocked', '0'),
+                        '_account_unsettledEquity': data.get('unsettledEquity', '0'),
+                        '_account_pnlUnrealized': data.get('pnlUnrealized', '0'),
+                        '_account_assetsValue': data.get('assetsValue', '0'),
+                        '_account_liabilitiesValue': data.get('liabilitiesValue', '0'),
+                        '_account_marginFraction': data.get('marginFraction', '0'),
+                    }
+
                     balance = BalanceData(
                         currency=currency,
                         free=free,
@@ -875,7 +890,7 @@ class BackpackRest(BackpackBase):
                         usd_value=self._safe_decimal(
                             item.get('balanceNotional', '0')),
                         timestamp=datetime.now(),
-                        raw_data=item
+                        raw_data=raw_data_with_account_info  # 🔥 使用增强的 raw_data
                     )
                     balances.append(balance)
 
