@@ -65,7 +65,7 @@ class GridTerminalUI:
 
         title = Text()
         title.append("🎯 网格交易系统实时监控 ", style="bold cyan")
-        title.append("v2.4", style="bold magenta")
+        title.append("v2.5", style="bold magenta")
         title.append(" - ", style="bold white")
         title.append(
             f"{self.coordinator.config.exchange.upper()}/", style="bold yellow")
@@ -212,6 +212,13 @@ class GridTerminalUI:
         content.append(f"网格间隔: ${stats.grid_interval}  ", style="cyan")
         content.append(
             f"反手距离: {self.coordinator.config.reverse_order_grid_distance}格\n", style="magenta")
+
+        # 🆕 显示单格金额（仅作为显示，无实质功能）
+        content.append(f"├─ 单格金额: ", style="white")
+        content.append(
+            f"{self.coordinator.config.order_amount} {self.base_currency}  ", style="bold cyan")
+        content.append(
+            f"数量精度: {self.coordinator.config.quantity_precision}位\n", style="white")
 
         content.append(
             f"├─ 当前价格: ${stats.current_price:,.2f}             ", style="bold yellow")
