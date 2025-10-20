@@ -11,6 +11,7 @@ from datetime import datetime
 
 from ....logging import get_logger
 from ..models import GridOrder, GridOrderSide
+from ..models.grid_config import GridType
 from .order_operations import OrderOperations
 
 
@@ -57,11 +58,56 @@ class ScalpingOperations:
         self.config = config
 
         # 创建订单操作实例
-        self.order_ops = OrderOperations(engine, state, config)
+        self.order_ops = OrderOperations(engine, state, config, coordinator)
+
+        # 🛡️ 操作频率限制（基于方向性订单成交，防止错误循环）
+        self._last_directional_order_id: str = ""  # 最后一次方向性订单的ID
+        self._same_directional_order_count = 0     # 同一方向性订单下的调整次数
+        self._max_same_directional_updates = 1    # 同一方向性订单只操作1次
+
+    def update_last_directional_order(self, order_id: str, order_side: str):
+        """
+        更新最后一次方向性订单ID（由coordinator在订单成交时调用）
+
+        Args:
+            order_id: 订单ID
+            order_side: 订单方向 ('Buy' 或 'Sell')
+        """
+        # 判断是否是方向性订单
+        is_directional = False
+
+        if self.config.grid_type == GridType.FOLLOW_LONG:
+            # 做多网格：只记录买单
+            is_directional = (order_side == 'Buy')
+        elif self.config.grid_type == GridType.FOLLOW_SHORT:
+            # 做空网格：只记录卖单
+            is_directional = (order_side == 'Sell')
+
+        if is_directional:
+            self._last_directional_order_id = order_id
+            self.logger.debug(
+                f"📌 更新方向性订单ID: {order_id} "
+                f"({'买单' if order_side == 'Buy' else '卖单'})"
+            )
 
     async def activate(self):
         """激活剥头皮模式（完整流程）"""
         self.logger.warning("🔴 正在激活剥头皮模式...")
+
+        # 🛡️ 0. 检查全局状态（REST失败或持仓异常时拒绝激活）
+        if hasattr(self.coordinator, 'is_emergency_stopped') and self.coordinator.is_emergency_stopped:
+            self.logger.error(
+                "🚨 系统紧急停止中（持仓异常），拒绝激活剥头皮模式！"
+            )
+            return
+
+        if hasattr(self.coordinator, 'is_paused') and self.coordinator.is_paused:
+            self.logger.error(
+                "⏸️ REST API不可用（连续失败），拒绝激活剥头皮模式！\n"
+                "   原因：无法获取准确持仓数据，操作存在风险\n"
+                "   等待REST API恢复后才能激活"
+            )
+            return
 
         # 1. 激活剥头皮管理器
         self.scalping_manager.activate()
@@ -72,65 +118,24 @@ class ScalpingOperations:
             self.scalping_manager.deactivate()
             return
 
-        # 3. 混合策略获取实时持仓：WebSocket优先，REST API备用
-        self.logger.info("📊 正在获取实时持仓信息（WebSocket优先，REST API备用）...")
+        # 🔥 3. 直接从tracker获取持仓（来自position_monitor的REST数据，每秒更新）
+        self.logger.info(
+            "📊 正在获取持仓信息（使用tracker数据，来自position_monitor的REST监控）...")
 
-        # 第一步：尝试从WebSocket缓存获取
-        position_data = await self.engine.get_real_time_position(self.config.symbol)
-        current_position = position_data['size']
-        average_cost = position_data['entry_price']
-        data_source = "WebSocket"
+        current_position = self.tracker.get_current_position()
+        average_cost = self.tracker.get_average_cost()
 
-        # 第二步：如果WebSocket缓存为空，使用REST API作为备用
-        if current_position == 0 and average_cost == 0:
-            self.logger.warning(
-                "⚠️ WebSocket持仓缓存为空（交易所未推送初始持仓），"
-                "使用REST API获取准确数据..."
+        # 🛡️ 3.1 检查持仓是否为0（剥头皮需要有持仓才能激活）
+        if current_position == 0:
+            self.logger.error(
+                "❌ 当前无持仓，无法激活剥头皮模式！\n"
+                "   剥头皮模式需要先有持仓才能激活"
             )
-
-            try:
-                positions = await self.engine.exchange.get_positions(
-                    symbols=[self.config.symbol]
-                )
-
-                if positions and len(positions) > 0:
-                    position = positions[0]
-                    current_position = position.size or Decimal('0')
-                    average_cost = position.entry_price or Decimal('0')
-
-                    # 根据方向确定持仓符号
-                    if hasattr(position, 'side'):
-                        from ....adapters.exchanges import PositionSide
-                        if position.side == PositionSide.SHORT and current_position != 0:
-                            current_position = -current_position
-
-                    data_source = "REST API"
-
-                    # 同步到WebSocket缓存（供后续使用）
-                    if not hasattr(self.engine.exchange, '_position_cache'):
-                        self.engine.exchange._position_cache = {}
-                    self.engine.exchange._position_cache[self.config.symbol] = {
-                        'size': current_position,
-                        'entry_price': average_cost,
-                        'unrealized_pnl': position.unrealized_pnl or Decimal('0'),
-                        'side': 'Long' if current_position > 0 else 'Short',
-                        'timestamp': datetime.now()
-                    }
-
-                    self.logger.info(
-                        f"✅ REST API获取成功: {current_position} {self.config.symbol.split('_')[0]}, "
-                        f"成本=${average_cost:,.2f}，已同步到WebSocket缓存"
-                    )
-                else:
-                    self.logger.warning("⚠️ REST API返回空持仓")
-
-            except Exception as e:
-                self.logger.error(f"❌ REST API获取持仓失败: {e}")
-                import traceback
-                self.logger.error(traceback.format_exc())
+            self.scalping_manager.deactivate()
+            return
 
         self.logger.info(
-            f"📊 最终持仓（来源: {data_source}）: "
+            f"📊 持仓（来源: position_monitor的REST数据）: "
             f"{current_position} {self.config.symbol.split('_')[0]}, "
             f"平均成本: ${average_cost:,.2f}"
         )
@@ -164,6 +169,23 @@ class ScalpingOperations:
     async def deactivate(self):
         """退出剥头皮模式，恢复正常网格"""
         self.logger.info("🟢 正在退出剥头皮模式...")
+
+        # 🛡️ 0. 检查全局状态（紧急停止时只停用管理器，不执行订单操作）
+        if hasattr(self.coordinator, 'is_emergency_stopped') and self.coordinator.is_emergency_stopped:
+            self.logger.error(
+                "🚨 系统紧急停止中，只停用剥头皮管理器，不执行订单操作！\n"
+                "   需人工检查后手动恢复订单"
+            )
+            self.scalping_manager.deactivate()
+            return
+
+        if hasattr(self.coordinator, 'is_paused') and self.coordinator.is_paused:
+            self.logger.warning(
+                "⏸️ REST API不可用，只停用剥头皮管理器，不执行订单操作\n"
+                "   等待REST API恢复后手动恢复订单"
+            )
+            self.scalping_manager.deactivate()
+            return
 
         # 1. 移除WebSocket持仓更新回调
         if hasattr(self.engine.exchange, '_position_callbacks'):
@@ -213,6 +235,23 @@ class ScalpingOperations:
             # 关键：设置重置标志，防止并发操作
             self.coordinator._resetting = True
             self.logger.warning("🎯 剥头皮止盈订单已成交！（锁定系统）")
+
+            # 🛡️ 0. 检查全局状态（紧急停止时只停止系统，不执行重置）
+            if hasattr(self.coordinator, 'is_emergency_stopped') and self.coordinator.is_emergency_stopped:
+                self.logger.error(
+                    "🚨 系统紧急停止中，止盈成交但不执行重置！\n"
+                    "   需人工检查后决定下一步操作"
+                )
+                await self.coordinator.stop()
+                return
+
+            if hasattr(self.coordinator, 'is_paused') and self.coordinator.is_paused:
+                self.logger.warning(
+                    "⏸️ REST API不可用，止盈成交但暂不执行重置\n"
+                    "   等待REST API恢复后再决定下一步操作"
+                )
+                # 先不停止系统，等待REST恢复
+                return
 
             # 等待一小段时间，让平仓完成并余额更新
             await asyncio.sleep(2)
@@ -270,13 +309,17 @@ class ScalpingOperations:
 
     async def place_take_profit_order_with_verification(
         self,
-        max_attempts: int = 3
+        max_attempts: int = 3,
+        skip_frequency_check: bool = False  # 🆕 是否跳过频率限制检查
     ) -> bool:
         """
         挂止盈订单，并验证成功
 
         Args:
             max_attempts: 最大尝试次数
+            skip_frequency_check: 是否跳过频率限制检查
+                - False（默认）：检查频率限制，防止错误循环
+                - True：跳过频率限制，用于更新操作（已取消旧订单）
 
         Returns:
             True: 止盈订单已挂出
@@ -285,12 +328,82 @@ class ScalpingOperations:
         if not self.scalping_manager or not self.scalping_manager.is_active():
             return False
 
+        # 🛡️ 0. 检查全局状态（REST失败或持仓异常时跳过挂单）
+        if hasattr(self.coordinator, 'is_emergency_stopped') and self.coordinator.is_emergency_stopped:
+            self.logger.error("🚨 系统紧急停止中，跳过挂止盈订单")
+            return False
+
+        if hasattr(self.coordinator, 'is_paused') and self.coordinator.is_paused:
+            self.logger.warning("⏸️ REST API不可用，跳过挂止盈订单（等待恢复）")
+            return False
+
+        # 🛡️ 1. 操作频率限制（基于方向性订单成交，防止错误循环）
+        # 🆕 如果是更新操作（已取消旧订单），跳过频率限制检查
+        if not skip_frequency_check:
+            current_directional_order_id = self._last_directional_order_id
+
+            if not hasattr(self, '_last_checked_directional_order_id'):
+                self._last_checked_directional_order_id = ""
+
+            if current_directional_order_id == self._last_checked_directional_order_id:
+                # 方向性订单ID未变化（无新的买单/卖单成交）
+                if self._same_directional_order_count >= self._max_same_directional_updates:
+                    direction_name = "买单" if self.config.grid_type == GridType.FOLLOW_LONG else "卖单"
+                    self.logger.warning(
+                        f"⏸️ 操作频率限制: 无新的{direction_name}成交，"
+                        f"已挂单{self._same_directional_order_count}次，达到上限（{self._max_same_directional_updates}次）\n"
+                        f"   防止错误循环，等待新的{direction_name}成交后才能继续操作\n"
+                        f"   最后方向性订单ID: {current_directional_order_id or '(无)'}"
+                    )
+                    return False
+                else:
+                    self._same_directional_order_count += 1
+                    direction_name = "买单" if self.config.grid_type == GridType.FOLLOW_LONG else "卖单"
+                    self.logger.info(
+                        f"📊 无新{direction_name}成交: "
+                        f"第{self._same_directional_order_count}/{self._max_same_directional_updates}次挂单操作"
+                    )
+            else:
+                # 方向性订单ID变化了（有新的买单/卖单成交）
+                direction_name = "买单" if self.config.grid_type == GridType.FOLLOW_LONG else "卖单"
+                if self._last_checked_directional_order_id:
+                    self.logger.info(
+                        f"🔄 检测到新{direction_name}成交: "
+                        f"{self._last_checked_directional_order_id[:8]}... → {current_directional_order_id[:8] if current_directional_order_id else '(无)'}..., "
+                        f"重置挂单计数器（上次挂单{self._same_directional_order_count}次）"
+                    )
+                self._last_checked_directional_order_id = current_directional_order_id
+                self._same_directional_order_count = 1
+        else:
+            self.logger.info("🔄 更新止盈订单: 跳过频率限制检查（已取消旧订单）")
+
         for attempt in range(max_attempts):
             self.logger.info(
                 f"🔄 挂止盈订单尝试 {attempt+1}/{max_attempts}..."
             )
 
-            # 1. 获取当前价格
+            # 🔥 1. 从tracker获取最新持仓（来自position_monitor的REST数据）
+            tracker_position = self.tracker.get_current_position()
+            tracker_cost = self.tracker.get_average_cost()
+
+            if tracker_position == 0:
+                self.logger.info("📋 tracker显示无持仓，无需挂止盈订单")
+                return True
+
+            self.logger.info(
+                f"📊 持仓验证（tracker）: {tracker_position} @ ${tracker_cost:,.2f}"
+            )
+
+            # 🔥 2. 更新ScalpingManager的持仓（确保一致）
+            initial_capital = self.scalping_manager.get_initial_capital()
+            self.scalping_manager.update_position(
+                tracker_position,
+                tracker_cost,
+                initial_capital,
+                self.coordinator.balance_monitor.collateral_balance
+            )
+
+            # 3. 获取当前价格
             try:
                 current_price = await self.engine.get_current_price()
             except Exception as e:
@@ -299,21 +412,107 @@ class ScalpingOperations:
                     await asyncio.sleep(0.5)
                 continue
 
-            # 2. 计算止盈订单
+            # 4. 计算止盈订单
             tp_order = self.scalping_manager.calculate_take_profit_order(
                 current_price)
 
             if not tp_order:
-                self.logger.info("📋 当前无持仓，无需挂止盈订单")
-                return True  # 无持仓视为成功
+                self.logger.warning("⚠️ 无法计算止盈订单")
+                if attempt < max_attempts - 1:
+                    continue
+                return False
 
-            # 3. 挂止盈订单（使用order_ops的验证挂单方法）
+            # 🔥 5. 验证止盈订单数量 = tracker持仓
+            if tp_order.amount != abs(tracker_position):
+                self.logger.error(
+                    f"❌ 安全拒绝: 止盈订单数量{tp_order.amount} "
+                    f"!= tracker持仓{abs(tracker_position)}，重新尝试..."
+                )
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(0.5)
+                    continue
+                return False
+
+            self.logger.info(
+                f"✅ 止盈订单验证通过: 数量{tp_order.amount} = tracker持仓{abs(tracker_position)}"
+            )
+
+            # 6. 挂止盈订单（使用order_ops的验证挂单方法）
             placed_order = await self.order_ops.place_order_with_verification(
                 tp_order, max_attempts=1  # 这里只尝试1次，外层循环会重试
             )
 
             if placed_order:
-                self.logger.info(f"✅ 止盈订单挂出成功（尝试{attempt+1}次）")
+                self.logger.info(
+                    f"✅ 止盈订单已挂出: {placed_order.order_id} "
+                    f"{placed_order.side.value} {placed_order.amount} @ ${placed_order.price}"
+                )
+
+                # 🔥 更新 ScalpingManager 的缓存，使用交易所返回的真实订单ID
+                self.scalping_manager.update_take_profit_order_with_real_id(
+                    placed_order)
+
+                # 🛡️ 最终验证：检查止盈订单是否符合预期
+                await asyncio.sleep(1.0)  # 等待1秒让订单状态稳定
+
+                self.logger.info("🔍 执行最终验证：检查止盈订单是否符合预期...")
+
+                # 1. 验证持仓是否还与挂单时一致
+                final_position = self.tracker.get_current_position()
+                if abs(final_position) != placed_order.amount:
+                    self.logger.error(
+                        f"🚨 最终验证失败: 持仓已变化！\n"
+                        f"   挂单时持仓: {placed_order.amount}\n"
+                        f"   当前持仓: {abs(final_position)}\n"
+                        f"   ⚠️ 止盈订单可能不匹配，请人工检查！\n"
+                        f"   系统不会执行额外操作，等待下次方向性订单成交"
+                    )
+                    return True  # 返回True表示挂单成功，但有警告
+
+                # 2. 验证止盈订单是否还存在且数量正确
+                try:
+                    open_orders = await self.engine.exchange.get_open_orders(
+                        symbol=self.config.symbol
+                    )
+                    tp_order_found = False
+                    tp_order_correct = False
+
+                    for order in open_orders:
+                        # placed_order 是 GridOrder，使用 order_id；order 是 OrderData，使用 id
+                        if order.id == placed_order.order_id:
+                            tp_order_found = True
+                            if order.amount == abs(final_position):
+                                tp_order_correct = True
+                                self.logger.info(
+                                    f"✅ 最终验证通过: 止盈订单存在且数量正确 "
+                                    f"({order.amount} = {abs(final_position)})"
+                                )
+                            else:
+                                self.logger.error(
+                                    f"🚨 最终验证失败: 止盈订单数量不匹配！\n"
+                                    f"   止盈订单数量: {order.amount}\n"
+                                    f"   当前持仓: {abs(final_position)}\n"
+                                    f"   ⚠️ 可能存在问题，请人工检查！\n"
+                                    f"   系统不会执行额外操作，等待下次方向性订单成交"
+                                )
+                            break
+
+                    if not tp_order_found:
+                        self.logger.error(
+                            f"🚨 最终验证失败: 止盈订单不存在！\n"
+                            f"   订单ID: {placed_order.order_id}\n"
+                            f"   ⚠️ 订单可能已被取消或成交，请人工检查！\n"
+                            f"   系统不会执行额外操作，等待下次方向性订单成交"
+                        )
+
+                except Exception as e:
+                    self.logger.error(
+                        f"🚨 最终验证出错: 无法获取开放订单\n"
+                        f"   错误: {e}\n"
+                        f"   ⚠️ 无法确认止盈订单状态，请人工检查！\n"
+                        f"   系统不会执行额外操作，等待下次方向性订单成交"
+                    )
+
                 return True
             else:
                 self.logger.warning(
@@ -331,13 +530,22 @@ class ScalpingOperations:
         if not self.scalping_manager or not self.scalping_manager.is_active():
             return
 
+        # 🛡️ 0. 检查全局状态（REST失败或持仓异常时跳过更新）
+        if hasattr(self.coordinator, 'is_emergency_stopped') and self.coordinator.is_emergency_stopped:
+            self.logger.warning("🚨 系统紧急停止中，跳过更新止盈订单")
+            return
+
+        if hasattr(self.coordinator, 'is_paused') and self.coordinator.is_paused:
+            self.logger.debug("⏸️ REST API不可用，跳过更新止盈订单（等待恢复）")
+            return
+
         current_position = self.tracker.get_current_position()
 
         # 检查止盈订单是否需要更新
         if not self.scalping_manager.is_take_profit_order_outdated(current_position):
             return
 
-        self.logger.info("📋 持仓变化，更新止盈订单...")
+        self.logger.info("📋 持仓变化，需要更新止盈订单...")
 
         # 1. 取消旧止盈订单（带验证）
         old_tp_order = self.scalping_manager.get_current_take_profit_order()
@@ -390,7 +598,11 @@ class ScalpingOperations:
                 return
 
         # 2. 挂新止盈订单（带验证）
-        if not await self.place_take_profit_order_with_verification(max_attempts=3):
+        # 🆕 跳过频率限制检查，因为"取消旧订单+挂新订单"是一个完整的更新操作
+        if not await self.place_take_profit_order_with_verification(
+            max_attempts=3,
+            skip_frequency_check=True  # 跳过频率限制
+        ):
             self.logger.error("❌ 挂新止盈订单失败")
         else:
             self.logger.info("✅ 止盈订单已更新")

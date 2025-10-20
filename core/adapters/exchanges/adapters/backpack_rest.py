@@ -1026,7 +1026,8 @@ class BackpackRest(BackpackBase):
                 )
 
                 if self.logger:
-                    self.logger.info(
+                    # 改为debug级别，避免终端刷屏（每秒1次查询）
+                    self.logger.debug(
                         f"📊 REST API持仓解析: {symbol} {side.value} "
                         f"数量={size_abs} (原始netQuantity={position_size}), "
                         f"成本={position.entry_price}, 未实现盈亏={unrealized_pnl}"

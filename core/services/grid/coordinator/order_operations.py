@@ -5,12 +5,15 @@
 """
 
 import asyncio
-from typing import List, Optional, Callable
+from typing import List, Optional, Callable, TYPE_CHECKING
 from decimal import Decimal
 
 from ....logging import get_logger
 from ..models import GridOrder, GridOrderSide, GridOrderStatus
 from .verification_utils import OrderVerificationUtils
+
+if TYPE_CHECKING:
+    from ....adapters.exchanges.models import OrderData
 
 
 class OrderOperations:
@@ -22,9 +25,10 @@ class OrderOperations:
     2. 挂单并验证
     3. 取消特定类型订单并验证
     4. 统一错误处理和重试逻辑
+    5. 🆕 订单操作暂停检查（REST失败保护）
     """
 
-    def __init__(self, engine, state, config):
+    def __init__(self, engine, state, config, coordinator=None):
         """
         初始化订单操作管理器
 
@@ -32,14 +36,43 @@ class OrderOperations:
             engine: 执行引擎
             state: 网格状态
             config: 网格配置
+            coordinator: 协调器引用（用于检查暂停状态）
         """
         self.logger = get_logger(__name__)
         self.engine = engine
         self.state = state
         self.config = config
+        self.coordinator = coordinator  # 🆕 添加coordinator引用
 
         # 创建验证工具实例
         self.verifier = OrderVerificationUtils(engine.exchange, config.symbol)
+
+    def _check_if_paused(self, operation_name: str) -> bool:
+        """
+        检查系统是否暂停或紧急停止
+
+        Args:
+            operation_name: 操作名称（用于日志）
+
+        Returns:
+            True if paused/stopped, False if OK to proceed
+        """
+        if not self.coordinator:
+            return False  # 没有coordinator引用，默认允许操作
+
+        if self.coordinator.is_emergency_stopped:
+            self.logger.error(
+                f"🚨 系统紧急停止中，禁止{operation_name}操作！"
+            )
+            return True
+
+        if self.coordinator.is_paused:
+            self.logger.warning(
+                f"⏸️ REST API暂时不可用，暂停{operation_name}操作（等待恢复）"
+            )
+            return True
+
+        return False
 
     async def cancel_all_orders_with_verification(
         self,
@@ -302,82 +335,233 @@ class OrderOperations:
     async def place_order_with_verification(
         self,
         order: GridOrder,
-        max_attempts: int = 3
+        max_attempts: int = 2  # 🔥 只重试1次（总共2次尝试）
     ) -> Optional[GridOrder]:
         """
-        挂单并验证
+        挂单并验证（新方案：提交→最终验证→重试）
 
-        循环逻辑：
-        1. 挂单
-        2. 从交易所验证订单已挂出
-        3. 如果未挂出，重新挂
-        4. 重复最多max_attempts次
+        🔥 核心改进：
+        1. 提交订单后，无论API成功还是失败，都执行最终验证
+        2. 最终验证：从交易所查询订单是否真实存在
+        3. 只有最终验证确认不存在，才重试
+        4. 避免"API失败但订单实际成功"导致的重复挂单
+
+        流程：
+        1. 提交订单（捕获API成功/失败）
+        2. 执行最终验证（两阶段：ID精确匹配 + 特征模糊匹配）
+        3. 验证通过 → 返回订单
+        4. 验证失败 → 等待5秒后重试（最多1次）
 
         Args:
             order: 待挂订单
-            max_attempts: 最大尝试次数
+            max_attempts: 最大尝试次数（默认2次）
 
         Returns:
             成功挂出的订单，失败返回None
         """
+        from ....adapters.exchanges.models import OrderData
+
+        # 🆕 检查系统是否暂停
+        if self._check_if_paused("挂单"):
+            return None
+
         for attempt in range(max_attempts):
             self.logger.info(
                 f"🔄 挂单尝试 {attempt+1}/{max_attempts}..."
             )
 
+            # ==================== 步骤1: 提交订单 ====================
+            api_success = False
+            returned_order = None
+            api_error_msg = None
+
             try:
-                # 1. 挂单
                 placed_order = await self.engine.place_order(order)
                 self.state.add_order(placed_order)
+                api_success = True
+                returned_order = placed_order
 
                 self.logger.info(
-                    f"💰 订单已提交: {placed_order.side.value} "
-                    f"{placed_order.amount}@${placed_order.price} "
-                    f"(Grid {placed_order.grid_id})"
+                    f"📤 挂单API调用成功: {placed_order.order_id} "
+                    f"{placed_order.side.value} {placed_order.amount} @ ${placed_order.price}"
                 )
 
-                # 2. 等待让交易所处理挂单请求（增加等待时间，适应交易所延迟）
-                await asyncio.sleep(1.0)
+            except Exception as e:
+                api_success = False
+                api_error_msg = str(e)
 
-                # 3. 🔥 关键：从交易所验证订单已挂出（多次重试验证）
-                verification_success = False
-                max_verify_attempts = 3
+                self.logger.warning(
+                    f"❌ 挂单API调用失败: {e}\n"
+                    f"   ⚠️ 注意：订单可能已提交但返回失败\n"
+                    f"   将执行最终验证确认订单是否真实存在"
+                )
 
-                for verify_attempt in range(max_verify_attempts):
-                    if await self.verifier.verify_order_exists(placed_order.order_id):
-                        self.logger.info(
-                            f"✅ 订单挂出成功（挂单尝试{attempt+1}次，验证尝试{verify_attempt+1}次）"
-                        )
-                        verification_success = True
-                        break
-                    else:
-                        if verify_attempt < max_verify_attempts - 1:
-                            self.logger.info(
-                                f"⏳ 验证尝试{verify_attempt+1}/{max_verify_attempts}: "
-                                f"订单未找到，等待1秒后重试验证..."
-                            )
-                            await asyncio.sleep(1.0)
-                        else:
-                            self.logger.warning(
-                                f"⚠️ 验证失败（{max_verify_attempts}次尝试后订单仍未找到）"
-                            )
+            # ==================== 步骤2: 最终验证 ====================
+            # 🔥 关键：无论API成功还是失败，都执行最终验证
 
-                if verification_success:
-                    return placed_order
+            self.logger.info("🔍 执行最终验证：从交易所查询订单...")
+            await asyncio.sleep(1.0)  # 等待订单状态稳定
+
+            verified_order = await self._final_verification(
+                returned_order.order_id if returned_order else None,
+                order
+            )
+
+            # ==================== 步骤3: 根据验证结果决定下一步 ====================
+            if verified_order:
+                # 验证通过：订单确实存在
+                if api_success:
+                    self.logger.info(
+                        f"✅ 挂单成功: API成功 + 最终验证通过\n"
+                        f"   订单ID: {verified_order.id}"
+                    )
                 else:
                     self.logger.warning(
-                        f"⚠️ 订单未在交易所找到，准备第{attempt+2}次挂单尝试..."
+                        f"⚠️ 挂单成功（特殊情况）: API失败 + 最终验证通过\n"
+                        f"   订单ID: {verified_order.id}\n"
+                        f"   API错误: {api_error_msg}\n"
+                        f"   说明：订单已提交但API返回失败"
                     )
-                    # 从本地状态移除，准备重试
-                    self.state.remove_order(placed_order.order_id)
 
-            except Exception as e:
-                self.logger.error(f"挂单失败: {e}")
+                # 将验证通过的订单转换为GridOrder格式返回
+                if returned_order:
+                    return returned_order
+                else:
+                    # API失败但订单存在，需要添加到状态
+                    grid_order = GridOrder(
+                        order_id=verified_order.id,
+                        grid_id=order.grid_id,
+                        side=order.side,
+                        price=verified_order.price,
+                        amount=verified_order.amount,
+                        status=GridOrderStatus.PENDING
+                    )
+                    self.state.add_order(grid_order)
+                    return grid_order
+
+            else:
+                # 验证失败：订单确实不存在
+                if api_success:
+                    self.logger.error(
+                        f"🚨 挂单失败（异常情况）: API成功 + 最终验证失败\n"
+                        f"   API返回订单ID: {returned_order.order_id if returned_order else 'None'}\n"
+                        f"   但交易所查询不到该订单\n"
+                        f"   可能原因：临时ID、订单被立即取消、API数据错误"
+                    )
+                    # 从本地状态移除
+                    if returned_order:
+                        self.state.remove_order(returned_order.order_id)
+                else:
+                    self.logger.error(
+                        f"❌ 挂单失败: API失败 + 最终验证失败\n"
+                        f"   API错误: {api_error_msg}\n"
+                        f"   交易所也没有该订单"
+                    )
+
+                # 准备重试
                 if attempt < max_attempts - 1:
-                    await asyncio.sleep(0.5)
+                    self.logger.info(
+                        f"⏳ 等待5秒后重试 {attempt+2}/{max_attempts}...")
+                    await asyncio.sleep(5.0)  # 🔥 重试间隔5秒
+                else:
+                    self.logger.error(f"❌ 挂单最终失败: 已尝试{max_attempts}次")
+                    return None
 
-        # 达到最大尝试次数，挂单仍失败
+        return None
+
+    async def _final_verification(
+        self,
+        returned_order_id: Optional[str],
+        expected_order: GridOrder
+    ) -> Optional['OrderData']:
+        """
+        最终验证：从交易所查询确认订单是否存在
+
+        验证策略（两阶段）：
+        1. 阶段1：如果有返回的订单ID，精确匹配
+        2. 阶段2：根据订单特征模糊匹配（价格+数量+方向）
+
+        Args:
+            returned_order_id: API返回的订单ID（可能为None）
+            expected_order: 期望的订单（包含价格、数量、方向）
+
+        Returns:
+            OrderData: 已确认存在的订单
+            None: 订单不存在
+        """
+        # 获取当前所有开放订单
+        try:
+            open_orders = await self.engine.exchange.get_open_orders(
+                symbol=self.config.symbol
+            )
+        except Exception as e:
+            self.logger.error(f"❌ 获取开放订单失败: {e}")
+            return None
+
+        # 阶段1: 如果有返回的订单ID，先精确匹配
+        if returned_order_id:
+            for order in open_orders:
+                if order.id == returned_order_id:
+                    self.logger.info(
+                        f"✅ 阶段1验证通过: 找到订单ID {returned_order_id}"
+                    )
+                    return order
+
+            self.logger.warning(
+                f"⚠️ 阶段1验证失败: 订单ID {returned_order_id} 不存在"
+            )
+
+        # 阶段2: 根据订单特征模糊匹配（防止ID丢失或API未返回ID）
+        for order in open_orders:
+            if self._is_matching_order(order, expected_order):
+                self.logger.info(
+                    f"✅ 阶段2验证通过: 找到匹配订单 {order.id}\n"
+                    f"   价格: ${order.price} (期望: ${expected_order.price})\n"
+                    f"   数量: {order.amount} (期望: {expected_order.amount})\n"
+                    f"   方向: {order.side.value} (期望: {expected_order.side.value})"
+                )
+                return order
+
+        # 两个阶段都失败
         self.logger.error(
-            f"❌ 挂单失败: 已尝试{max_attempts}次"
+            f"❌ 最终验证失败: 未找到匹配订单\n"
+            f"   期望订单: {expected_order.side.value} "
+            f"{expected_order.amount} @ ${expected_order.price}"
         )
         return None
+
+    def _is_matching_order(
+        self,
+        actual: 'OrderData',
+        expected: GridOrder
+    ) -> bool:
+        """
+        判断订单是否匹配
+
+        验证维度：
+        1. 方向匹配（必须完全一致）
+        2. 价格匹配（允许0.1%误差）
+        3. 数量匹配（允许0.01%误差）
+
+        Args:
+            actual: 交易所返回的实际订单
+            expected: 期望的订单
+
+        Returns:
+            bool: 是否匹配
+        """
+        # 1. 方向必须完全一致
+        if actual.side.value != expected.side.value:
+            return False
+
+        # 2. 价格匹配（允许0.1%误差）
+        price_diff = abs(actual.price - expected.price)
+        price_tolerance = expected.price * Decimal('0.001')  # 0.1%
+        price_match = price_diff <= price_tolerance
+
+        # 3. 数量匹配（允许0.01%误差）
+        amount_diff = abs(actual.amount - expected.amount)
+        amount_tolerance = expected.amount * Decimal('0.0001')  # 0.01%
+        amount_match = amount_diff <= amount_tolerance
+
+        return price_match and amount_match

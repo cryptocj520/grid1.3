@@ -1,7 +1,8 @@
 """
 持仓监控模块
 
-提供WebSocket + REST混合持仓监控策略
+🔥 重大修改：完全使用REST API进行持仓同步（不再依赖WebSocket）
+原因：Backpack WebSocket持仓流不推送订单成交导致的变化，导致缓存过期
 """
 
 import asyncio
@@ -15,13 +16,17 @@ from ....logging import get_logger
 
 class PositionMonitor:
     """
-    持仓监控管理器（WebSocket优先，REST备用，自动重连）
+    持仓监控管理器（纯REST API）
 
     职责：
-    1. WebSocket持仓监控（实时）
-    2. REST API备用监控（WebSocket失败时）
-    3. 定期REST校验（心跳检测）
-    4. WebSocket自动重连
+    1. 定时REST查询（30秒间隔）
+    2. 事件触发REST查询（5秒去重）
+    3. REST失败保护（暂停订单）
+    4. 持仓异常检测（紧急停止）
+
+    设计原则：
+    - 持仓数据：REST API（准确但较慢）
+    - 订单数据：WebSocket（快速且可靠）- 由其他模块处理
     """
 
     def __init__(self, engine, tracker, config, coordinator):
@@ -40,82 +45,55 @@ class PositionMonitor:
         self.config = config
         self.coordinator = coordinator
 
-        # WebSocket监控状态
-        self._position_ws_enabled: bool = False
-        self._last_position_ws_time: float = 0
-        self._last_order_filled_time: float = 0
+        # 🆕 REST查询配置
+        self._rest_query_interval: int = 1   # REST查询间隔（秒）- 适应剧烈波动
+        self._rest_query_debounce: int = 5   # 事件触发去重时间（秒）
+        self._rest_timeout: int = 5          # REST查询超时（秒）
 
-        # REST备用监控状态
-        self._last_position_rest_sync: float = 0
+        # 🆕 REST失败保护配置
+        self._rest_max_failures: int = 3     # 最大连续失败次数
+        self._rest_failure_count: int = 0    # 当前连续失败次数
+        self._rest_last_success_time: float = 0  # 最后成功时间
+        self._rest_last_query_time: float = 0    # 最后查询时间
+        self._rest_is_available: bool = True     # REST API可用性
 
-        # REST定期校验状态
-        self._last_position_rest_verify_time: float = 0
+        # 🆕 持仓异常保护配置
+        self._position_change_alert_threshold: float = 100  # 持仓变化告警阈值（%）
+        self._position_max_multiplier: int = 10             # 最大持仓倍数
 
-        # 持仓缓存
-        self._last_ws_position_size = Decimal('0')
-        self._last_ws_position_price = Decimal('0')
+        # 持仓缓存（用于变化检测）
+        self._last_position_size = Decimal('0')
+        self._last_position_price = Decimal('0')
 
-        # 配置参数
-        self._position_ws_response_timeout: int = 5  # WebSocket响应超时（秒）
-        self._position_rest_verify_interval: int = 60  # REST校验间隔（秒）
-        self._scalping_position_check_interval: int = 1  # REST备用轮询间隔（秒）
+        # 事件触发查询去重
+        self._last_event_query_time: float = 0
 
         # 监控任务
         self._running = False
         self._monitor_task: Optional[asyncio.Task] = None
 
     async def start_monitoring(self):
-        """启动持仓监控"""
+        """启动持仓监控（纯REST API）"""
         if self._running:
             self.logger.warning("持仓监控已经在运行")
             return
 
         self._running = True
 
-        # 订阅WebSocket持仓更新
-        try:
-            self.logger.info("🔄 订阅WebSocket持仓更新流...")
-
-            if hasattr(self.engine.exchange, 'subscribe_position_updates'):
-                await self.engine.exchange.subscribe_position_updates(
-                    self.config.symbol,
-                    self._on_position_update
-                )
-                self._position_ws_enabled = True
-                # 🔥 同步更新 GridCoordinator 的标志
-                self.coordinator._position_ws_enabled = True
-                self.logger.info("✅ WebSocket持仓更新流订阅成功")
-            else:
-                self.logger.warning("⚠️ 交易所不支持WebSocket持仓订阅")
-        except Exception as e:
-            self.logger.warning(f"⚠️ WebSocket持仓订阅失败: {e}")
-            self._position_ws_enabled = False
-            # 🔥 同步更新 GridCoordinator 的标志
-            self.coordinator._position_ws_enabled = False
-
-        # 用REST API同步初始持仓
+        # 🆕 用REST API同步初始持仓
         try:
             self.logger.info("📊 正在同步初始持仓数据（REST API）...")
-            positions = await self.engine.exchange.get_positions([self.config.symbol])
-            if positions:
-                position = positions[0]
-                position_qty = position.size if position.side.value.lower() == 'long' else - \
-                    position.size
-                self.tracker.sync_initial_position(
-                    position=position_qty,
-                    entry_price=position.entry_price
-                )
-                self.logger.info(
-                    f"✅ 初始持仓同步完成（REST）: {position.side.value} {position.size} @ ${position.entry_price}"
-                )
-            else:
-                self.logger.info("📊 REST API显示无持仓")
+            await self._query_and_update_position(is_initial=True)
+            self.logger.info("✅ 初始持仓同步完成（REST）")
         except Exception as rest_error:
-            self.logger.warning(f"⚠️ REST API初始持仓同步失败: {rest_error}")
+            self.logger.error(f"❌ REST API初始持仓同步失败: {rest_error}")
+            self._rest_failure_count += 1
+            # 初始同步失败也记录，但不阻止启动
 
-        # 启动监控循环
-        self._monitor_task = asyncio.create_task(self._position_sync_loop())
-        self.logger.info("✅ 持仓监控已启动（WebSocket优先，REST备用，自动重连）")
+        # 启动REST定时查询循环
+        self._monitor_task = asyncio.create_task(
+            self._rest_position_query_loop())
+        self.logger.info("✅ 持仓监控已启动（纯REST API，1秒高频查询，适应剧烈波动）")
 
     async def stop_monitoring(self):
         """停止持仓监控"""
@@ -129,239 +107,236 @@ class PositionMonitor:
                 pass
             self.logger.info("✅ 持仓监控已停止")
 
-    async def _on_position_update(self, position_info: Dict[str, Any]):
+    async def _query_and_update_position(self, is_initial: bool = False, is_event_triggered: bool = False) -> bool:
         """
-        WebSocket持仓更新回调
+        查询并更新持仓数据（核心方法）
 
         Args:
-            position_info: 持仓信息字典
+            is_initial: 是否是初始同步
+            is_event_triggered: 是否是事件触发（而非定时查询）
+
+        Returns:
+            bool: 查询是否成功
         """
         try:
-            symbol = position_info.get('symbol')
-            if symbol != self.config.symbol:
-                return
+            current_time = time.time()
+            self._rest_last_query_time = current_time
 
-            position_size = position_info.get('size', 0)
-            entry_price = position_info.get('entry_price', 0)
-            side = position_info.get('side', 'Unknown')
+            # 查询持仓
+            positions = await asyncio.wait_for(
+                self.engine.exchange.get_positions([self.config.symbol]),
+                timeout=self._rest_timeout
+            )
 
-            # 同步持仓到追踪器
+            if not positions:
+                # 无持仓
+                if is_initial or self._last_position_size != Decimal('0'):
+                    self.logger.info("📊 REST查询: 当前无持仓")
+                    self.tracker.sync_initial_position(
+                        position=Decimal('0'),
+                        entry_price=Decimal('0')
+                    )
+                    self._last_position_size = Decimal('0')
+                    self._last_position_price = Decimal('0')
+
+                    # 更新剥头皮管理器
+                    if self.coordinator.scalping_manager and self.coordinator.scalping_manager.is_active():
+                        initial_capital = self.coordinator.scalping_manager.get_initial_capital()
+                        self.coordinator.scalping_manager.update_position(
+                            Decimal('0'), Decimal('0'),
+                            initial_capital, self.coordinator.balance_monitor.collateral_balance
+                        )
+
+                # 🆕 REST查询成功
+                self._rest_failure_count = 0
+                self._rest_last_success_time = current_time
+                self._rest_is_available = True
+
+                # 🆕 恢复订单操作（如果之前被暂停）
+                if hasattr(self.coordinator, 'is_paused') and self.coordinator.is_paused:
+                    self.logger.info("✅ REST API恢复正常，解除订单暂停")
+                    self.coordinator.is_paused = False
+
+                return True
+
+            # 有持仓
+            position = positions[0]
+            position_qty = position.size if position.side.value.lower() == 'long' else - \
+                position.size
+
+            # 🆕 持仓异常检测
+            if not is_initial:
+                await self._check_position_anomaly(position_qty)
+
+            # 更新持仓追踪器
             self.tracker.sync_initial_position(
-                position=position_size,
-                entry_price=entry_price
+                position=position_qty,
+                entry_price=position.entry_price
             )
 
-            # 更新WebSocket最后接收时间
-            self._last_position_ws_time = time.time()
+            # 检测持仓变化
+            position_changed = (position_qty != self._last_position_size)
 
-            # 更新WebSocket持仓记录
-            self._last_ws_position_size = position_size
-            self._last_ws_position_price = entry_price
+            # 更新剥头皮管理器（如果持仓变化）
+            if position_changed and self.coordinator.scalping_manager and self.coordinator.scalping_manager.is_active():
+                initial_capital = self.coordinator.scalping_manager.get_initial_capital()
+                self.coordinator.scalping_manager.update_position(
+                    position_qty, position.entry_price,
+                    initial_capital, self.coordinator.balance_monitor.collateral_balance
+                )
 
-            # 标记WebSocket持仓监控为启用状态
-            if not self._position_ws_enabled:
-                self._position_ws_enabled = True
-                # 🔥 同步更新 GridCoordinator 的标志
-                self.coordinator._position_ws_enabled = True
-                self.logger.info("✅ WebSocket持仓监控已启用（收到首次持仓更新）")
+            # 记录日志
+            if is_initial:
+                self.logger.info(
+                    f"✅ 初始持仓: {position.side.value} {abs(position_qty)} @ ${position.entry_price}"
+                )
+            elif position_changed:
+                self.logger.info(
+                    f"📡 REST同步: 持仓变化 {self._last_position_size} → {position_qty}, "
+                    f"成本=${position.entry_price:.2f}"
+                )
 
-            self.logger.info(
-                f"📊 WebSocket持仓同步: {symbol} {side} "
-                f"数量={position_size}, 成本=${entry_price}"
+            # 更新缓存
+            self._last_position_size = position_qty
+            self._last_position_price = position.entry_price
+
+            # 🆕 REST查询成功
+            self._rest_failure_count = 0
+            self._rest_last_success_time = current_time
+            self._rest_is_available = True
+
+            # 🆕 恢复订单操作（如果之前被暂停）
+            if hasattr(self.coordinator, 'is_paused') and self.coordinator.is_paused:
+                self.logger.info("✅ REST API恢复正常，解除订单暂停")
+                self.coordinator.is_paused = False
+
+            return True
+
+        except asyncio.TimeoutError:
+            self._rest_failure_count += 1
+            self.logger.error(
+                f"❌ REST查询超时（>{self._rest_timeout}秒）"
+                f"[失败次数: {self._rest_failure_count}/{self._rest_max_failures}]"
             )
+            await self._handle_rest_failure()
+            return False
 
         except Exception as e:
-            self.logger.error(f"❌ 处理WebSocket持仓更新失败: {e}")
-            import traceback
-            self.logger.error(traceback.format_exc())
+            self._rest_failure_count += 1
+            self.logger.error(
+                f"❌ REST查询失败: {e} "
+                f"[失败次数: {self._rest_failure_count}/{self._rest_max_failures}]"
+            )
+            await self._handle_rest_failure()
+            return False
 
-    async def _position_sync_loop(self):
-        """持仓同步监控循环"""
-        self._last_position_ws_time = time.time()
-        self._last_position_rest_sync = 0
-        last_rest_log_time = 0
+    async def _check_position_anomaly(self, new_position: Decimal):
+        """
+        检测持仓异常（防止持仓失控）
 
-        # 配置参数
-        rest_sync_interval = self._scalping_position_check_interval
-        ws_reconnect_interval = 5
-        monitor_check_interval = 1
-        rest_log_interval = 60
+        Args:
+            new_position: 新的持仓数量
+        """
+        if self._last_position_size == Decimal('0'):
+            return  # 首次有持仓，不检测
 
+        # 计算持仓变化率
+        position_change = abs(new_position - self._last_position_size)
+        if self._last_position_size != Decimal('0'):
+            change_percentage = (
+                position_change / abs(self._last_position_size)) * 100
+        else:
+            change_percentage = Decimal('0')
+
+        # 告警阈值检测
+        if change_percentage > self._position_change_alert_threshold:
+            self.logger.warning(
+                f"⚠️ 持仓变化异常告警: {self._last_position_size} → {new_position}, "
+                f"变化率={change_percentage:.1f}% (阈值={self._position_change_alert_threshold}%)"
+            )
+
+        # 紧急停止检测
+        expected_max_position = abs(
+            self._last_position_size) * self._position_max_multiplier
+        if abs(new_position) > expected_max_position and expected_max_position > 0:
+            self.logger.critical(
+                f"🚨 持仓异常！紧急停止交易！\n"
+                f"   上次持仓: {self._last_position_size}\n"
+                f"   当前持仓: {new_position}\n"
+                f"   超出预期: {self._position_max_multiplier}倍\n"
+                f"   需要人工确认后才能恢复！"
+            )
+            # 🆕 触发紧急停止
+            self.coordinator.is_emergency_stopped = True
+            self.coordinator.is_paused = True
+
+    async def _handle_rest_failure(self):
+        """处理REST查询失败"""
+        self._rest_is_available = False
+
+        # 连续失败达到阈值：暂停订单操作
+        if self._rest_failure_count >= self._rest_max_failures:
+            if not hasattr(self.coordinator, 'is_paused') or not self.coordinator.is_paused:
+                self.logger.error(
+                    f"🚫 REST连续失败{self._rest_failure_count}次，暂停所有订单操作！\n"
+                    f"   将持续尝试重连，成功后自动恢复..."
+                )
+                self.coordinator.is_paused = True
+
+    async def _rest_position_query_loop(self):
+        """REST定时查询循环（核心监控循环）"""
         self.logger.info(
-            f"🔄 持仓同步监控已启动: "
-            f"WS响应超时={self._position_ws_response_timeout}秒, "
-            f"REST校验间隔={self._position_rest_verify_interval}秒"
+            f"🔄 REST持仓查询循环已启动: 间隔={self._rest_query_interval}秒"
         )
-
-        last_ws_reconnect_attempt = 0
 
         while self._running:
             try:
-                await asyncio.sleep(monitor_check_interval)
+                await asyncio.sleep(self._rest_query_interval)
 
-                current_time = time.time()
+                # 定时查询
+                success = await self._query_and_update_position(is_initial=False, is_event_triggered=False)
 
-                # 检查WebSocket健康状态
-                if self._position_ws_enabled:
-                    ws_should_fail = False
-
-                    # 条件1：订单成交了，但WebSocket没有响应
-                    if self._last_order_filled_time > 0:
-                        order_ws_delay = current_time - self._last_order_filled_time
-                        ws_response_delay = self._last_order_filled_time - self._last_position_ws_time
-
-                        if order_ws_delay > self._position_ws_response_timeout and ws_response_delay > 0:
-                            self.logger.warning(
-                                f"⚠️ WebSocket失效: 订单成交{order_ws_delay:.1f}秒后仍无持仓更新，"
-                                f"切换到REST备用模式"
-                            )
-                            ws_should_fail = True
-
-                    # 条件2：剥头皮模式下持仓为0（异常情况）
-                    if self.coordinator.scalping_manager and self.coordinator.scalping_manager.is_active():
-                        current_position = self.tracker.get_current_position()
-                        if abs(current_position) == 0:
-                            self.logger.warning(
-                                f"⚠️ WebSocket异常: 剥头皮模式下持仓为0（不应该发生），"
-                                f"切换到REST备用模式"
-                            )
-                            ws_should_fail = True
-
-                    if ws_should_fail:
-                        self._position_ws_enabled = False
-
-                # 定期REST校验（心跳检测）
-                if self._position_ws_enabled:
-                    time_since_last_verify = current_time - self._last_position_rest_verify_time
-
-                    if time_since_last_verify >= self._position_rest_verify_interval:
-                        await self._verify_position_with_rest()
-                        self._last_position_rest_verify_time = current_time
-
-                # REST备用同步
-                if not self._position_ws_enabled:
-                    if current_time - self._last_position_rest_sync > rest_sync_interval:
-                        await self._sync_position_with_rest(current_time, last_rest_log_time, rest_log_interval)
-                        self._last_position_rest_sync = current_time
-
-                # 尝试重连WebSocket
-                if not self._position_ws_enabled and (current_time - last_ws_reconnect_attempt > ws_reconnect_interval):
-                    await self._reconnect_websocket()
-                    last_ws_reconnect_attempt = current_time
+                if success:
+                    self.logger.debug(f"✅ 定时REST查询成功")
+                else:
+                    self.logger.warning(f"⚠️ 定时REST查询失败")
 
             except asyncio.CancelledError:
-                self.logger.info("🔄 持仓同步监控任务已取消")
+                self.logger.info("🔄 REST查询循环已取消")
                 break
             except Exception as e:
-                self.logger.error(f"❌ 持仓同步监控错误: {e}")
+                self.logger.error(f"❌ REST查询循环错误: {e}")
                 import traceback
                 self.logger.error(traceback.format_exc())
                 await asyncio.sleep(10)
 
-        self.logger.info("🔄 持仓同步监控任务已退出")
+        self.logger.info("🔄 REST查询循环已退出")
 
-    async def _verify_position_with_rest(self):
-        """使用REST API验证WebSocket持仓（心跳检测）"""
-        try:
-            positions = await self.engine.exchange.get_positions([self.config.symbol])
+    async def trigger_event_query(self, event_name: str = "unknown"):
+        """
+        事件触发的持仓查询（带去重）
 
-            if positions and len(positions) > 0:
-                position = positions[0]
-                rest_position = position.size or Decimal('0')
+        Args:
+            event_name: 事件名称（用于日志）
+        """
+        current_time = time.time()
 
-                # 根据方向确定持仓符号
-                if hasattr(position, 'side'):
-                    from ....adapters.exchanges import PositionSide
-                    if position.side == PositionSide.SHORT and rest_position != 0:
-                        rest_position = -rest_position
+        # 去重：5秒内只查询一次
+        if current_time - self._last_event_query_time < self._rest_query_debounce:
+            self.logger.debug(
+                f"⏭️ 跳过事件查询（{event_name}）：去重时间未到"
+            )
+            return
 
-                ws_position = self._last_ws_position_size
-                position_diff = abs(rest_position - ws_position)
+        self._last_event_query_time = current_time
+        self.logger.info(f"🔔 事件触发持仓查询: {event_name}")
 
-                if position_diff > Decimal('0.01'):
-                    self.logger.warning(
-                        f"⚠️ WebSocket持仓校验失败: "
-                        f"WS={ws_position}, REST={rest_position}, "
-                        f"差异={position_diff}, 切换到REST备用模式"
-                    )
-                    self._position_ws_enabled = False
+        await self._query_and_update_position(is_initial=False, is_event_triggered=True)
 
-                    # 立即用REST数据更新持仓
-                    if self.coordinator.scalping_manager and self.coordinator.scalping_manager.is_active():
-                        initial_capital = self.coordinator.scalping_manager.get_initial_capital()
-                        self.coordinator.scalping_manager.update_position(
-                            rest_position, position.entry_price,
-                            initial_capital, self.coordinator.balance_monitor.collateral_balance
-                        )
-                        self._last_ws_position_size = rest_position
-                        self._last_ws_position_price = position.entry_price
-                else:
-                    self.logger.info(
-                        f"✅ WebSocket持仓校验通过: WS={ws_position}, REST={rest_position}"
-                    )
-        except Exception as e:
-            self.logger.warning(f"⚠️ REST持仓校验失败: {e}")
-
-    async def _sync_position_with_rest(self, current_time, last_rest_log_time, rest_log_interval):
-        """使用REST API同步持仓（WebSocket失败时）"""
-        try:
-            positions = await self.engine.exchange.get_positions([self.config.symbol])
-            if positions:
-                position = positions[0]
-                position_qty = position.size if position.side.value.lower() == 'long' else - \
-                    position.size
-
-                self.tracker.sync_initial_position(
-                    position=position_qty,
-                    entry_price=position.entry_price
-                )
-
-                # 剥头皮模式：检查持仓变化并更新止盈订单
-                if self.coordinator.scalping_manager and self.coordinator.scalping_manager.is_active():
-                    old_position = self._last_ws_position_size
-
-                    if position_qty != old_position:
-                        initial_capital = self.coordinator.scalping_manager.get_initial_capital()
-                        self.coordinator.scalping_manager.update_position(
-                            position_qty, position.entry_price,
-                            initial_capital, self.coordinator.balance_monitor.collateral_balance
-                        )
-
-                        self._last_ws_position_size = position_qty
-                        self._last_ws_position_price = position.entry_price
-
-                        self.logger.info(
-                            f"📡 REST备用同步: 数量 {old_position} → {position_qty}, "
-                            f"成本=${position.entry_price:.2f}"
-                        )
-        except Exception as e:
-            self.logger.warning(f"⚠️ REST持仓同步失败: {e}")
-
-    async def _reconnect_websocket(self):
-        """尝试重连WebSocket"""
-        try:
-            self.logger.info("🔄 尝试重新订阅WebSocket持仓更新...")
-
-            if hasattr(self.engine.exchange, 'subscribe_position_updates'):
-                await self.engine.exchange.subscribe_position_updates(
-                    self.config.symbol,
-                    self._on_position_update
-                )
-                self._position_ws_enabled = True
-                # 🔥 同步更新 GridCoordinator 的标志
-                self.coordinator._position_ws_enabled = True
-                self._last_position_ws_time = time.time()
-                self.logger.info("✅ WebSocket持仓订阅重连成功！")
-        except Exception as e:
-            self.logger.warning(f"⚠️ WebSocket重连失败: {e}")
-
-    def record_order_filled(self):
-        """记录订单成交时间（用于WebSocket响应检测）"""
-        self._last_order_filled_time = time.time()
+    def is_rest_available(self) -> bool:
+        """REST API是否可用"""
+        return self._rest_is_available
 
     def get_position_data_source(self) -> str:
         """获取当前持仓数据来源"""
-        if self._position_ws_enabled:
-            return "WebSocket实时"
-        else:
-            return "REST API备用"
+        return "REST API"

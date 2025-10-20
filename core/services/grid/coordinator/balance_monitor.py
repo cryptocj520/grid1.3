@@ -144,11 +144,19 @@ class BalanceMonitor:
                             # 🔥 使用新模块执行止盈重置
                             await self.coordinator.reset_manager.execute_take_profit_reset()
 
-                self.logger.info(
-                    f"💰 余额已更新: 现货=${self._spot_balance:,.2f}, "
-                    f"抵押品=${self._collateral_balance:,.2f}, "
-                    f"订单冻结=${self._order_locked_balance:,.2f}"
-                )
+                # 只在首次或有显著变化时输出info，其他用debug
+                if self._last_balance_update is None:
+                    self.logger.info(
+                        f"💰 初始余额: 现货=${self._spot_balance:,.2f}, "
+                        f"抵押品=${self._collateral_balance:,.2f}, "
+                        f"订单冻结=${self._order_locked_balance:,.2f}"
+                    )
+                else:
+                    self.logger.debug(
+                        f"💰 余额查询: 现货=${self._spot_balance:,.2f}, "
+                        f"抵押品=${self._collateral_balance:,.2f}, "
+                        f"订单冻结=${self._order_locked_balance:,.2f}"
+                    )
             else:
                 all_currencies = [b.currency for b in balances]
                 self.logger.warning(

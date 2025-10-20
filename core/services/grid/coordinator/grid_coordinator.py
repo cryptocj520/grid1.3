@@ -80,6 +80,10 @@ class GridCoordinator:
         self._paused = False
         self._resetting = False  # 🔥 重置进行中标志（本金保护、剥头皮重置等）
 
+        # 🆕 系统状态管理（REST失败保护）
+        self.is_paused = False  # REST失败时暂停订单操作
+        self.is_emergency_stopped = False  # 持仓异常时紧急停止
+
         # 异常计数
         self._error_count = 0
         self._max_errors = 5  # 最大错误次数，超过则暂停
@@ -295,8 +299,10 @@ class GridCoordinator:
                 f"(Grid {filled_order.grid_id})"
             )
 
-            # 🔥 记录订单成交时间（用于持仓监控健康检查）
-            self.position_monitor.record_order_filled()
+            # 🔥 触发持仓查询（订单成交后立即查询持仓，带5秒去重）
+            asyncio.create_task(
+                self.position_monitor.trigger_event_query("订单成交")
+            )
 
             # 1. 更新状态
             self.state.mark_order_filled(
@@ -314,6 +320,12 @@ class GridCoordinator:
                 if self._is_take_profit_order_filled(filled_order):
                     await self.scalping_ops.handle_take_profit_filled()
                     return  # 止盈成交后不再挂反向订单
+
+                # 🆕 更新最后一次方向性订单ID（做多追踪买单，做空追踪卖单）
+                self.scalping_ops.update_last_directional_order(
+                    order_id=filled_order.order_id,
+                    order_side=filled_order.side.value
+                )
 
                 # 更新持仓信息到剥头皮管理器
                 current_position = self.tracker.get_current_position()
@@ -491,11 +503,167 @@ class GridCoordinator:
             )
             asyncio.create_task(self.pause())
 
+    async def _cleanup_before_start(self):
+        """
+        启动前清理旧订单和持仓
+
+        目的：
+        1. 避免ORDER_LIMIT错误（交易所订单数量上限）
+        2. 确保系统从干净状态启动
+        3. 避免本地状态与交易所状态不一致
+
+        清理步骤：
+        1. 取消所有开放订单
+        2. 平掉所有持仓（市价单）
+        3. 等待清理生效
+        """
+        self.logger.info("=" * 80)
+        self.logger.info("🧹 启动前清理：正在清理旧订单和持仓...")
+        self.logger.info("=" * 80)
+
+        # 步骤1: 取消所有旧订单
+        try:
+            self.logger.info("📋 步骤1: 正在取消所有旧订单...")
+
+            # 获取当前所有订单
+            existing_orders = await self.engine.exchange.get_open_orders(
+                symbol=self.config.symbol
+            )
+
+            if len(existing_orders) > 0:
+                self.logger.warning(
+                    f"⚠️ 检测到{len(existing_orders)}个旧订单，正在取消..."
+                )
+
+                # 批量取消订单
+                cancel_count = 0
+                for order in existing_orders:
+                    try:
+                        await self.engine.exchange.cancel_order(
+                            order_id=order.id,
+                            symbol=self.config.symbol
+                        )
+                        cancel_count += 1
+                    except Exception as e:
+                        self.logger.warning(f"取消订单{order.id}失败: {e}")
+
+                self.logger.info(
+                    f"✅ 已取消{cancel_count}/{len(existing_orders)}个旧订单")
+
+                # 等待取消生效
+                await asyncio.sleep(2)
+
+                # 验证是否清理成功
+                remaining_orders = await self.engine.exchange.get_open_orders(
+                    symbol=self.config.symbol
+                )
+                if len(remaining_orders) > 0:
+                    self.logger.warning(
+                        f"⚠️ 仍有{len(remaining_orders)}个订单未取消，将继续尝试..."
+                    )
+                else:
+                    self.logger.info("✅ 所有旧订单已清理")
+            else:
+                self.logger.info("✅ 无旧订单，跳过清理")
+
+        except Exception as e:
+            self.logger.error(f"❌ 清理旧订单失败: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+
+        # 步骤2: 平掉所有持仓
+        try:
+            self.logger.info("📊 步骤2: 正在检查持仓...")
+
+            # 获取当前持仓
+            positions = await self.engine.exchange.get_positions(
+                symbols=[self.config.symbol]
+            )
+
+            if positions and len(positions) > 0:
+                position = positions[0]
+                position_size = position.size or Decimal('0')
+
+                if position_size != 0:
+                    self.logger.warning(
+                        f"⚠️ 检测到持仓: {position_size} {self.config.symbol.split('_')[0]}, "
+                        f"成本=${position.entry_price}, "
+                        f"未实现盈亏=${position.unrealized_pnl}"
+                    )
+
+                    # 计算平仓方向和数量
+                    close_side = 'Sell' if position_size > 0 else 'Buy'
+                    close_amount = abs(position_size)
+
+                    self.logger.warning(
+                        f"🔄 正在平仓: {close_side} {close_amount} (市价单)..."
+                    )
+
+                    # 使用市价单平仓（参考 order_health_checker.py 的实现）
+                    try:
+                        from ....adapters.exchanges.models import OrderSide, OrderType
+
+                        # 确定平仓方向：平多仓=卖出，平空仓=买入
+                        order_side = OrderSide.SELL if close_side == 'Sell' else OrderSide.BUY
+
+                        # 调用交易所接口平仓（使用市价单）
+                        # 注意：使用 create_order 而不是 place_order，参数是 amount 不是 quantity
+                        placed_order = await self.engine.exchange.create_order(
+                            symbol=self.config.symbol,
+                            side=order_side,
+                            order_type=OrderType.MARKET,
+                            amount=close_amount,
+                            price=None  # 市价单不需要价格
+                        )
+
+                        self.logger.info(f"✅ 平仓订单已提交: {placed_order.id}")
+
+                        # 等待平仓完成
+                        await asyncio.sleep(3)
+
+                        # 验证是否平仓成功
+                        new_positions = await self.engine.exchange.get_positions(
+                            symbols=[self.config.symbol]
+                        )
+                        if new_positions and len(new_positions) > 0:
+                            new_position_size = new_positions[0].size or Decimal(
+                                '0')
+                            if new_position_size == 0:
+                                self.logger.info("✅ 持仓已清空")
+                            else:
+                                self.logger.warning(
+                                    f"⚠️ 持仓未完全清空，剩余: {new_position_size}"
+                                )
+                        else:
+                            self.logger.info("✅ 持仓已清空")
+
+                    except Exception as e:
+                        self.logger.error(f"❌ 平仓失败: {e}")
+                        import traceback
+                        self.logger.error(traceback.format_exc())
+                else:
+                    self.logger.info("✅ 无持仓，跳过平仓")
+            else:
+                self.logger.info("✅ 无持仓，跳过平仓")
+
+        except Exception as e:
+            self.logger.error(f"❌ 检查/平仓失败: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+
+        self.logger.info("=" * 80)
+        self.logger.info("✅ 启动前清理完成")
+        self.logger.info("=" * 80)
+        self.logger.info("")  # 空行分隔
+
     async def start(self):
         """启动网格系统"""
         if self._running:
             self.logger.warning("网格系统已经在运行")
             return
+
+        # 🆕 启动前清理旧订单和持仓
+        await self._cleanup_before_start()
 
         await self.initialize()
         await self.engine.start()
@@ -1206,7 +1374,7 @@ class GridCoordinator:
             current_price)
 
         if not tp_order:
-            self.logger.info("📋 当前无持仓，不挂止盈订单")
+            self.logger.warning("⚠️ 无法计算止盈订单（可能原因：初始本金未设置或无持仓）")
             return
 
         try:
@@ -1237,23 +1405,25 @@ class GridCoordinator:
         """
         判断在剥头皮模式下是否应该挂反向订单
 
+        ⚠️ 剥头皮模式下不挂任何反向订单
+
+        核心原则：
+        - 剥头皮模式只保留被动成交订单（已有的挂单）
+        - 除了止盈订单（由scalping_ops单独管理），不主动挂任何新订单
+        - 订单成交后只更新止盈订单，不补新单
+
+        工作流程：
+        1. 做多网格：价格下跌，买单成交 → 只更新止盈订单，不补买单
+        2. 做多网格：价格上涨，止盈订单成交 → 退出剥头皮，重置网格
+        3. 任何其他订单成交 → 更新止盈订单，不挂反向订单
+
         Args:
             filled_order: 已成交订单
 
         Returns:
-            是否应该挂反向订单
+            False - 剥头皮模式下禁止所有反向订单
         """
-        from ..models import GridType
-
-        # 做多网格：只挂买单（建仓），不挂卖单（平仓）
-        if self.config.grid_type in [GridType.LONG, GridType.FOLLOW_LONG, GridType.MARTINGALE_LONG]:
-            # 如果成交的是买单，应该挂卖单，但剥头皮模式不挂
-            return filled_order.side == GridOrderSide.SELL
-
-        # 做空网格：只挂卖单（建仓），不挂买单（平仓）
-        else:
-            # 如果成交的是卖单，应该挂买单，但剥头皮模式不挂
-            return filled_order.side == GridOrderSide.BUY
+        return False  # 🔥 剥头皮模式下禁止所有反向订单
 
     def _sync_orders_from_engine(self):
         """

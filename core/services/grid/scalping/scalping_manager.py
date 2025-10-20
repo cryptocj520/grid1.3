@@ -291,6 +291,28 @@ class ScalpingManager:
         """获取当前的止盈订单"""
         return self._take_profit_order
 
+    def update_take_profit_order_with_real_id(self, real_order: GridOrder):
+        """
+        更新止盈订单为交易所返回的真实订单
+
+        Args:
+            real_order: 交易所返回的真实订单（包含真实订单ID）
+        """
+        if self._take_profit_order:
+            # 保留临时订单的grid_id，使用真实订单的其他信息
+            self._take_profit_order = GridOrder(
+                order_id=real_order.order_id,  # 🔥 使用真实订单ID
+                grid_id=self._take_profit_order.grid_id,
+                side=real_order.side,
+                price=real_order.price,
+                amount=real_order.amount,
+                status=real_order.status,
+                created_at=real_order.created_at
+            )
+            self.logger.debug(
+                f"🔄 更新止盈订单ID: 临时ID → {real_order.order_id}"
+            )
+
     def is_take_profit_order_outdated(self, current_position: Decimal) -> bool:
         """
         判断当前止盈订单是否已过时（持仓数量发生变化）

@@ -398,6 +398,7 @@ class PositionTrackerImpl(IPositionTracker):
             position: 初始持仓数量（正数=多仓，负数=空仓）
             entry_price: 平均入场价格
         """
+        old_position = self.current_position
         self.current_position = position
         self.average_cost = entry_price
 
@@ -407,10 +408,17 @@ class PositionTrackerImpl(IPositionTracker):
         else:
             self.position_cost = Decimal('0')
 
-        self.logger.info(
-            f"🔄 同步初始持仓: 数量={position}, "
-            f"成本=${entry_price}, 总成本=${self.position_cost}"
-        )
+        # 只在首次同步或持仓变化时输出info，其他时候用debug（避免终端刷屏）
+        if old_position != position:
+            self.logger.info(
+                f"🔄 同步持仓变化: {old_position} → {position}, "
+                f"成本=${entry_price}, 总成本=${self.position_cost}"
+            )
+        else:
+            self.logger.debug(
+                f"🔄 同步持仓: 数量={position}, "
+                f"成本=${entry_price}, 总成本=${self.position_cost}"
+            )
 
     def __repr__(self) -> str:
         return (

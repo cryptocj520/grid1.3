@@ -47,7 +47,7 @@ class GridResetManager:
         self.strategy = strategy
 
         # 创建订单操作实例
-        self.order_ops = OrderOperations(engine, state, config)
+        self.order_ops = OrderOperations(engine, state, config, coordinator)
 
     async def execute_capital_protection_reset(self):
         """执行本金保护重置（平仓后重置并重新初始化本金）"""

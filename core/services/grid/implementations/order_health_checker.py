@@ -42,86 +42,40 @@ class OrderHealthChecker:
 
     async def _fetch_orders_and_positions(self) -> Tuple[List, List[PositionData]]:
         """
-        获取订单和持仓数据（使用协调器的统一数据源）
+        获取订单和持仓数据（纯REST API）
 
-        🔥 关键改进：
-        - 订单：从交易所REST API获取（实时准确）
-        - 持仓：从Coordinator统计数据获取（与终端UI一致，使用WebSocket缓存）
+        🔥 重大修改：持仓数据也使用REST API，不再依赖WebSocket缓存
+        原因：Backpack WebSocket持仓流不推送订单成交导致的变化
 
-        这样确保健康检查看到的持仓数据与终端UI显示的完全一致！
+        修改内容：
+        - 订单：从交易所REST API获取（实时准确）✅
+        - 持仓：从交易所REST API获取（不再使用WebSocket缓存）✅
 
         Returns:
             (订单列表, 持仓列表)
         """
         try:
-            # 获取订单（使用REST API，这部分没问题）
+            # 获取订单（使用REST API）
             orders = await self.engine.exchange.get_open_orders(self.config.symbol)
 
-            # 🔥 从Coordinator获取持仓数据（与终端UI保持一致）
-            positions = []
-            if self.engine.coordinator:
-                try:
-                    # 获取协调器的统计数据（已经包含了WebSocket的持仓信息）
-                    stats = await self.engine.coordinator.get_statistics()
+            # 🆕 获取持仓（使用REST API）
+            try:
+                positions = await self.engine.exchange.get_positions([self.config.symbol])
 
-                    # 从统计数据中提取持仓信息
-                    if stats.current_position != 0:
-                        from core.adapters.exchanges.models import PositionSide, MarginMode
-                        from datetime import datetime
+                if positions:
+                    self.logger.info(
+                        f"📊 健康检查使用REST API持仓数据: "
+                        f"方向={positions[0].side.value}, 数量={positions[0].size}, "
+                        f"成本={positions[0].entry_price}"
+                    )
+                else:
+                    self.logger.info("📊 健康检查: REST API显示无持仓")
 
-                        # 根据持仓数量判断方向
-                        if stats.current_position > 0:
-                            position_side = PositionSide.LONG
-                            position_size = stats.current_position
-                        else:
-                            position_side = PositionSide.SHORT
-                            position_size = abs(stats.current_position)
-
-                        position = PositionData(
-                            symbol=self.config.symbol,
-                            side=position_side,
-                            size=position_size,
-                            entry_price=stats.average_cost,
-                            mark_price=None,
-                            current_price=None,
-                            unrealized_pnl=stats.unrealized_pnl,
-                            realized_pnl=stats.realized_pnl,
-                            percentage=None,
-                            leverage=self.config.leverage if hasattr(
-                                self.config, 'leverage') else 1,
-                            margin_mode=MarginMode.CROSS,
-                            margin=Decimal('0'),
-                            liquidation_price=None,
-                            timestamp=datetime.now(),
-                            raw_data={'source': 'coordinator_statistics'}
-                        )
-                        positions.append(position)
-
-                        self.logger.info(
-                            f"📊 使用Coordinator统计数据（与终端UI一致）: "
-                            f"方向={position_side.value}, 数量={position_size}, "
-                            f"成本={stats.average_cost}"
-                        )
-                    else:
-                        self.logger.info("📊 Coordinator统计显示无持仓")
-
-                except Exception as coord_error:
-                    self.logger.warning(
-                        f"⚠️ 从Coordinator获取持仓失败，回退到REST API: {coord_error}")
-                    # 回退到REST API
-                    try:
-                        positions = await self.engine.exchange.get_positions([self.config.symbol])
-                    except Exception as rest_error:
-                        self.logger.error(f"❌ REST API获取持仓也失败: {rest_error}")
-                        positions = []
-            else:
-                # 如果没有coordinator引用，使用REST API
-                self.logger.warning("⚠️ 未找到Coordinator引用，使用REST API获取持仓")
-                try:
-                    positions = await self.engine.exchange.get_positions([self.config.symbol])
-                except Exception as rest_error:
-                    self.logger.error(f"❌ REST API获取持仓失败: {rest_error}")
-                    positions = []
+            except Exception as rest_error:
+                self.logger.error(f"❌ REST API获取持仓失败: {rest_error}")
+                import traceback
+                self.logger.error(traceback.format_exc())
+                positions = []
 
             return orders, positions
 
@@ -680,6 +634,78 @@ class OrderHealthChecker:
                             f"⚠️ 二次验证: 持仓仍异常 - {', '.join(position_health['issues'])}"
                         )
                     self.logger.info("继续执行修复流程...")
+
+            # ==================== 阶段2.5: 剥头皮模式持仓偏差检测 ====================
+            # 🆕 如果是剥头皮模式，检查持仓偏差是否严重
+            if is_scalping_active:
+                self.logger.info("🔍 阶段2.5: 剥头皮模式持仓偏差检测")
+
+                # 计算偏差
+                expected_pos = position_health['expected_position']
+                actual_pos = position_health['actual_position']
+
+                if expected_pos != 0:
+                    position_diff = abs(actual_pos - expected_pos)
+                    deviation_percent = float(
+                        position_diff / abs(expected_pos) * 100)
+
+                    self.logger.info(
+                        f"📊 持仓偏差分析:\n"
+                        f"   预期持仓: {expected_pos}\n"
+                        f"   实际持仓: {actual_pos}\n"
+                        f"   偏差: {deviation_percent:.1f}%"
+                    )
+
+                    # 判断偏差等级（两级：警告10% + 紧急停止50%）
+                    warning_threshold = 10   # 警告阈值：10%
+                    emergency_threshold = 50  # 紧急停止阈值：50%
+
+                    if deviation_percent >= emergency_threshold:
+                        # 紧急级别：触发紧急停止
+                        self.logger.critical(
+                            f"🚨 剥头皮模式持仓偏差达到紧急阈值！\n"
+                            f"   预期持仓: {expected_pos}\n"
+                            f"   实际持仓: {actual_pos}\n"
+                            f"   偏差: {deviation_percent:.1f}% (紧急阈值: {emergency_threshold}%)\n"
+                            f"   ⚠️ 触发紧急停止，停止所有订单操作！\n"
+                            f"   需要人工检查和干预！"
+                        )
+
+                        # 触发紧急停止
+                        coordinator.is_emergency_stopped = True
+
+                        # 不再继续执行后续的修复流程
+                        self.logger.critical("🚨 终止健康检查，等待人工干预")
+                        return
+
+                    elif deviation_percent >= warning_threshold:
+                        # 警告级别：输出警告
+                        self.logger.warning(
+                            f"⚠️ 剥头皮模式持仓偏差超过警告阈值\n"
+                            f"   预期持仓: {expected_pos}\n"
+                            f"   实际持仓: {actual_pos}\n"
+                            f"   偏差: {deviation_percent:.1f}% (警告阈值: {warning_threshold}%)\n"
+                            f"   请关注持仓变化"
+                        )
+
+                    else:
+                        # 正常级别
+                        self.logger.info(
+                            f"✅ 剥头皮模式持仓检查通过，偏差: {deviation_percent:.1f}%"
+                        )
+
+                elif actual_pos != 0:
+                    # 预期持仓为0，但实际有持仓
+                    self.logger.critical(
+                        f"🚨 剥头皮模式异常：预期持仓为0，但实际持仓为{actual_pos}！\n"
+                        f"   触发紧急停止，需要人工检查！"
+                    )
+                    coordinator.is_emergency_stopped = True
+                    self.logger.critical("🚨 终止健康检查，等待人工干预")
+                    return
+                else:
+                    # 预期和实际都为0
+                    self.logger.info("✅ 剥头皮模式持仓检查通过，预期和实际均为0")
 
             # ==================== 阶段3: 记录持仓检查结果（暂不调整）====================
             # 注意：此时只记录持仓状态，不立即调整
