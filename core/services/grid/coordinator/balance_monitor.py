@@ -44,6 +44,9 @@ class BalanceMonitor:
         self._order_locked_balance: Decimal = Decimal('0')  # 订单冻结余额
         self._last_balance_update: Optional[datetime] = None
 
+        # 💰 初始本金（独立维护，无论是否启用本金保护都记录）
+        self._initial_capital: Decimal = Decimal('0')  # 启动时的初始账户权益
+
         # 监控任务
         self._running = False
         self._monitor_task: Optional[asyncio.Task] = None
@@ -170,6 +173,11 @@ class BalanceMonitor:
 
     def _initialize_managers_capital(self):
         """初始化各个管理器的本金（首次获取时）"""
+        # 💰 首先记录BalanceMonitor自己的初始本金（无论是否启用本金保护）
+        if self._initial_capital == Decimal('0') and self._collateral_balance > 0:
+            self._initial_capital = self._collateral_balance
+            self.logger.info(f"💰 初始本金已记录: ${self._initial_capital:,.2f} USDC")
+
         # 本金保护管理器
         if self.coordinator.capital_protection_manager:
             if self.coordinator.capital_protection_manager.get_initial_capital() == Decimal('0'):
@@ -221,3 +229,8 @@ class BalanceMonitor:
     def order_locked_balance(self) -> Decimal:
         """订单冻结余额"""
         return self._order_locked_balance
+
+    @property
+    def initial_capital(self) -> Decimal:
+        """初始本金"""
+        return self._initial_capital

@@ -18,6 +18,7 @@ from rich.text import Text
 
 from ...logging import get_logger
 from .models import GridStatistics, GridType
+from .models.grid_order import GridOrderStatus, GridOrderSide
 from .coordinator import GridCoordinator
 
 
@@ -65,7 +66,7 @@ class GridTerminalUI:
 
         title = Text()
         title.append("🎯 网格交易系统实时监控 ", style="bold cyan")
-        title.append("v2.5", style="bold magenta")
+        title.append("v2.6", style="bold magenta")
         title.append(" - ", style="bold white")
         title.append(
             f"{self.coordinator.config.exchange.upper()}/", style="bold yellow")
@@ -306,6 +307,215 @@ class GridTerminalUI:
 
         return Panel(content, title="📋 订单统计", border_style="blue")
 
+    def _calculate_liquidation_price(self, stats: GridStatistics) -> tuple:
+        """
+        计算爆仓价格（仅作为风险提示，无实质功能）
+
+        核心思路（更简单合理）：
+        1. 假设极端情况：所有未成交的方向性订单全部成交
+        2. 计算最终持仓和平均成本
+        3. 用公式直接求出爆仓价格（净权益 = 0）
+
+        适用于所有模式（包括剥头皮模式）
+
+        爆仓条件: 净权益 ≤ 0
+        净权益 = 当前权益 + 持仓未实现盈亏
+
+        Returns:
+            (liquidation_price, distance_percent, risk_level)
+            - liquidation_price: 爆仓价格（Decimal），None表示无风险
+            - distance_percent: 距离当前价格的百分比（float）
+            - risk_level: 风险等级 'safe'/'warning'/'danger'/'N/A'
+        """
+        from decimal import Decimal
+
+        try:
+            # 获取未成交订单（从 GridState 的 active_orders 字典获取）
+            open_orders = [
+                order for order in self.coordinator.state.active_orders.values()
+                if order.status == GridOrderStatus.PENDING  # 只获取待成交的订单
+            ]
+
+            # 特殊情况: 无持仓且无订单，不计算
+            if stats.current_position == 0 and len(open_orders) == 0:
+                return (None, 0.0, 'N/A')
+
+            # 获取当前状态
+            current_equity = stats.collateral_balance  # 当前权益
+            current_position = stats.current_position  # 当前持仓（正数=多，负数=空）
+            average_cost = stats.average_cost  # 平均成本
+            current_price = stats.current_price  # 当前价格
+
+            # 判断网格类型（基于当前持仓或订单方向）
+            if current_position > 0:
+                is_long = True
+            elif current_position < 0:
+                is_long = False
+            else:
+                # 无持仓，根据订单判断
+                buy_orders = [
+                    o for o in open_orders if o.side == GridOrderSide.BUY]
+                is_long = len(buy_orders) > 0
+
+            if is_long:
+                # 做多网格：计算所有买单成交后的爆仓价格
+                liquidation_price = self._calculate_long_liquidation(
+                    current_equity, current_position, average_cost, open_orders
+                )
+                if liquidation_price:
+                    distance_percent = float(
+                        (liquidation_price - current_price) / current_price * 100)
+                else:
+                    return (None, 0.0, 'safe')  # 权益充足，不会爆仓
+            else:
+                # 做空网格：计算所有卖单成交后的爆仓价格
+                liquidation_price = self._calculate_short_liquidation(
+                    current_equity, current_position, average_cost, open_orders
+                )
+                if liquidation_price:
+                    distance_percent = float(
+                        (liquidation_price - current_price) / current_price * 100)
+                else:
+                    return (None, 0.0, 'safe')  # 权益充足，不会爆仓
+
+            # 判断风险等级
+            abs_distance = abs(distance_percent)
+            if abs_distance > 20:
+                risk_level = 'safe'
+            elif abs_distance > 10:
+                risk_level = 'warning'
+            else:
+                risk_level = 'danger'
+
+            return (liquidation_price, distance_percent, risk_level)
+
+        except Exception as e:
+            self.logger.error(f"计算爆仓价格失败: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return (None, 0.0, 'N/A')
+
+    def _calculate_long_liquidation(self, equity: Decimal, position: Decimal,
+                                    avg_cost: Decimal, open_orders: list) -> Decimal:
+        """
+        计算做多网格的爆仓价格（极端情况：所有买单成交）
+
+        核心思路：
+        1. 假设所有未成交买单全部成交
+        2. 计算最终持仓和平均成本
+        3. 用公式直接求出爆仓价格
+
+        公式推导：
+        净权益 = 0
+        equity + final_position × (liquidation_price - final_avg_cost) = 0
+        => liquidation_price = final_avg_cost - equity / final_position
+
+        Args:
+            equity: 当前权益
+            position: 当前持仓数量（正数或0）
+            avg_cost: 平均成本
+            open_orders: 未成交订单列表
+
+        Returns:
+            爆仓价格（Decimal），None表示权益充足不会爆仓
+        """
+        from decimal import Decimal
+
+        # 获取所有未成交的买单
+        buy_orders = [o for o in open_orders if o.side == GridOrderSide.BUY]
+
+        if len(buy_orders) == 0:
+            # 无未成交买单
+            if position == 0:
+                return None  # 无持仓也无订单
+            # 有持仓但无订单，直接计算
+            liquidation_price = avg_cost - equity / position
+            return liquidation_price if liquidation_price > 0 else None
+
+        # 假设所有买单全部成交，计算最终持仓和平均成本
+        total_buy_amount = sum(o.amount for o in buy_orders)
+        total_buy_cost = sum(o.amount * o.price for o in buy_orders)
+
+        final_position = position + total_buy_amount
+
+        if position > 0:
+            # 有初始持仓
+            final_avg_cost = (position * avg_cost +
+                              total_buy_cost) / final_position
+        else:
+            # 无初始持仓
+            final_avg_cost = total_buy_cost / final_position
+
+        # 计算爆仓价格
+        # equity + final_position × (liquidation_price - final_avg_cost) = 0
+        # => liquidation_price = final_avg_cost - equity / final_position
+        liquidation_price = final_avg_cost - equity / final_position
+
+        # 如果爆仓价格为负数或极小值，表示权益充足
+        if liquidation_price <= 0:
+            return None
+
+        return liquidation_price
+
+    def _calculate_short_liquidation(self, equity: Decimal, position: Decimal,
+                                     avg_cost: Decimal, open_orders: list) -> Decimal:
+        """
+        计算做空网格的爆仓价格（极端情况：所有卖单成交）
+
+        核心思路：
+        1. 假设所有未成交卖单全部成交
+        2. 计算最终持仓和平均成本
+        3. 用公式直接求出爆仓价格
+
+        公式推导：
+        净权益 = 0
+        equity + |final_position| × (final_avg_cost - liquidation_price) = 0
+        => liquidation_price = final_avg_cost + equity / |final_position|
+
+        Args:
+            equity: 当前权益
+            position: 当前持仓数量（负数或0）
+            avg_cost: 平均成本
+            open_orders: 未成交订单列表
+
+        Returns:
+            爆仓价格（Decimal），None表示权益充足不会爆仓
+        """
+        from decimal import Decimal
+
+        # 获取所有未成交的卖单
+        sell_orders = [o for o in open_orders if o.side == GridOrderSide.SELL]
+
+        if len(sell_orders) == 0:
+            # 无未成交卖单
+            if position == 0:
+                return None  # 无持仓也无订单
+            # 有持仓但无订单，直接计算
+            liquidation_price = avg_cost + equity / abs(position)
+            return liquidation_price
+
+        # 假设所有卖单全部成交，计算最终持仓和平均成本
+        total_sell_amount = sum(o.amount for o in sell_orders)
+        total_sell_cost = sum(o.amount * o.price for o in sell_orders)
+
+        position_abs = abs(position)
+        final_position_abs = position_abs + total_sell_amount
+
+        if position_abs > 0:
+            # 有初始持仓
+            final_avg_cost = (position_abs * avg_cost +
+                              total_sell_cost) / final_position_abs
+        else:
+            # 无初始持仓
+            final_avg_cost = total_sell_cost / final_position_abs
+
+        # 计算爆仓价格
+        # equity + final_position_abs × (final_avg_cost - liquidation_price) = 0
+        # => liquidation_price = final_avg_cost + equity / final_position_abs
+        liquidation_price = final_avg_cost + equity / final_position_abs
+
+        return liquidation_price
+
     def create_position_panel(self, stats: GridStatistics) -> Panel:
         """创建持仓信息面板"""
         position_color = "green" if stats.current_position > 0 else "red" if stats.current_position < 0 else "white"
@@ -319,7 +529,11 @@ class GridTerminalUI:
         content.append(f"├─ 当前持仓: ", style="white")
         content.append(
             f"{stats.current_position:+.4f} {self.base_currency} ({position_type})      ", style=f"bold {position_color}")
-        content.append(f"平均成本: ${stats.average_cost:,.2f}\n", style="white")
+
+        # 🆕 计算持仓金额（仅作为显示，无实质功能）
+        position_value = abs(stats.current_position) * stats.average_cost
+        content.append(f"平均成本: ${stats.average_cost:,.2f}  ", style="white")
+        content.append(f"持仓金额: ${position_value:,.2f}\n", style="bold cyan")
 
         # 🔥 显示持仓数据来源（实时）
         data_source = stats.position_data_source
@@ -336,7 +550,34 @@ class GridTerminalUI:
         content.append(f"├─ 数据来源: ", style="white")
         content.append(f"{source_icon} {data_source}\n", style=source_color)
 
-        # 🛡️ 本金保护模式状态和余额显示
+        # 💰 基础资金信息（始终显示）
+        # 显示初始本金和当前权益
+        content.append(
+            f"├─ 初始本金: ${stats.initial_capital:,.3f} USDC      ", style="white")
+        content.append(
+            f"当前权益: ${stats.collateral_balance:,.3f} USDC\n", style="yellow")
+
+        # 计算并显示本金盈亏
+        profit_loss = stats.capital_profit_loss
+        if profit_loss >= 0:
+            pl_sign = "+"
+            pl_color = "bold green"
+            pl_emoji = "📈"
+        else:
+            pl_sign = ""
+            pl_color = "bold red"
+            pl_emoji = "📉"
+
+        profit_loss_rate = (profit_loss / stats.initial_capital *
+                            100) if stats.initial_capital > 0 else Decimal('0')
+        content.append(f"├─ 本金盈亏: ", style="white")
+        content.append(f"{pl_emoji} ", style=pl_color)
+        content.append(
+            f"{pl_sign}${profit_loss:,.3f} ({pl_sign}{profit_loss_rate:.2f}%)\n",
+            style=pl_color
+        )
+
+        # 🛡️ 本金保护模式状态
         if stats.capital_protection_enabled:
             # 显示本金保护状态
             if stats.capital_protection_active:
@@ -348,32 +589,6 @@ class GridTerminalUI:
 
             content.append(f"├─ 本金保护: ", style="white")
             content.append(f"{status_text}\n", style=status_color)
-
-            # 显示初始本金
-            content.append(
-                f"├─ 初始本金: ${stats.initial_capital:,.3f} USDC      ", style="white")
-            content.append(
-                f"当前抵押品: ${stats.collateral_balance:,.3f} USDC\n", style="yellow")
-
-            # 计算并显示盈亏
-            profit_loss = stats.capital_profit_loss
-            if profit_loss >= 0:
-                pl_sign = "+"
-                pl_color = "bold green"
-                pl_emoji = "📈"
-            else:
-                pl_sign = ""
-                pl_color = "bold red"
-                pl_emoji = "📉"
-
-            profit_loss_rate = (profit_loss / stats.initial_capital *
-                                100) if stats.initial_capital > 0 else Decimal('0')
-            content.append(f"├─ 本金盈亏: ", style="white")
-            content.append(f"{pl_emoji} ", style=pl_color)
-            content.append(
-                f"{pl_sign}${profit_loss:,.3f} ({pl_sign}{profit_loss_rate:.2f}%)\n",
-                style=pl_color
-            )
 
         # 🔒 价格锁定模式状态
         if stats.price_lock_enabled:
@@ -390,30 +605,50 @@ class GridTerminalUI:
             content.append(
                 f"阈值: ${stats.price_lock_threshold:,.2f}\n", style="white")
 
-            # 显示其他余额信息
-            content.append(
-                f"├─ 现货余额: ${stats.spot_balance:,.2f} USDC      ", style="white")
-            content.append(
-                f"订单冻结: ${stats.order_locked_balance:,.2f} USDC\n", style="white")
-            content.append(
-                f"├─ 总资金: ${stats.total_balance:,.2f} USDC\n", style="bold cyan")
-        else:
-            # 未启用本金保护模式，显示常规余额信息
-            content.append(
-                f"├─ 现货余额: ${stats.spot_balance:,.2f} USDC      ", style="white")
-            content.append(
-                f"抵押品: ${stats.collateral_balance:,.2f} USDC\n", style="yellow")
-            content.append(
-                f"├─ 订单冻结: ${stats.order_locked_balance:,.2f} USDC      ", style="white")
-            content.append(
-                f"总资金: ${stats.total_balance:,.2f} USDC\n", style="cyan")
+        # 💵 余额信息（始终显示）
+        content.append(
+            f"├─ 现货余额: ${stats.spot_balance:,.2f} USDC      ", style="white")
+        content.append(
+            f"订单冻结: ${stats.order_locked_balance:,.2f} USDC\n", style="white")
 
         # 未实现盈亏（始终显示）
-        content.append(f"└─ 未实现盈亏: ", style="white")
+        content.append(f"├─ 未实现盈亏: ", style="white")
         content.append(f"{unrealized_sign}${stats.unrealized_profit:,.2f} ",
                        style=f"bold {unrealized_color}")
-        content.append(f"({unrealized_sign}{stats.unrealized_profit/abs(stats.current_position * stats.current_price) * 100 if stats.current_position != 0 else 0:.2f}%)",
+        content.append(f"({unrealized_sign}{stats.unrealized_profit/abs(stats.current_position * stats.current_price) * 100 if stats.current_position != 0 else 0:.2f}%)\n",
                        style=unrealized_color)
+
+        # 🆕 爆仓风险提示（仅作为风险提示，无实质功能）
+        liquidation_price, distance_percent, risk_level = self._calculate_liquidation_price(
+            stats)
+
+        content.append(f"└─ 爆仓风险: ", style="white")
+
+        if risk_level == 'N/A':
+            # 剥头皮模式或无持仓
+            content.append("N/A", style="cyan")
+        elif liquidation_price is None:
+            # 网格范围内安全
+            content.append("✅ 安全（网格内不会爆仓）", style="bold green")
+        else:
+            # 显示爆仓价格和距离
+            direction_icon = "⬇️" if stats.current_position > 0 else "⬆️"
+
+            # 根据风险等级设置颜色
+            if risk_level == 'safe':
+                risk_color = "green"
+                risk_icon = "✅"
+            elif risk_level == 'warning':
+                risk_color = "yellow"
+                risk_icon = "⚠️"
+            else:  # danger
+                risk_color = "red"
+                risk_icon = "🚨"
+
+            content.append(
+                f"{risk_icon} ${liquidation_price:,.2f} ", style=f"bold {risk_color}")
+            content.append(
+                f"({direction_icon} {abs(distance_percent):.1f}%)", style=risk_color)
 
         return Panel(content, title="💰 持仓信息", border_style="yellow")
 

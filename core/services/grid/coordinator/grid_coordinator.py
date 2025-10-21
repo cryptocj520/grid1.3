@@ -873,13 +873,18 @@ class GridCoordinator:
         stats.order_locked_balance = balances['order_locked_balance']
         stats.total_balance = balances['total_balance']
 
+        # 💰 初始本金和盈亏（始终设置，无论是否启用本金保护）
+        stats.initial_capital = self.balance_monitor.initial_capital
+        if stats.initial_capital > 0:
+            stats.capital_profit_loss = self.balance_monitor.collateral_balance - \
+                stats.initial_capital
+        else:
+            stats.capital_profit_loss = Decimal('0')
+
         # 🛡️ 本金保护模式状态
         if self.capital_protection_manager:
             stats.capital_protection_enabled = True
             stats.capital_protection_active = self.capital_protection_manager.is_active()
-            stats.initial_capital = self.capital_protection_manager.get_initial_capital()
-            stats.capital_profit_loss = self.capital_protection_manager.get_profit_loss(
-                self.balance_monitor.collateral_balance)  # 🔥 使用 BalanceMonitor 的余额
 
         # 🔄 价格脱离监控状态（价格移动网格专用）
         if self.config.is_follow_mode() and self._price_escape_start_time is not None:
