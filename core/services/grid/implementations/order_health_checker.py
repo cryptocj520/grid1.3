@@ -49,8 +49,8 @@ class OrderHealthChecker:
         log_file = f"logs/{__name__}.log"
         file_handler = RotatingFileHandler(
             log_file,
-            maxBytes=50 * 1024 * 1024,  # 50MB
-            backupCount=5,
+            maxBytes=5 * 1024 * 1024,  # 5MB (与 logging.yaml 保持一致)
+            backupCount=3,  # 3个备份
             encoding='utf-8'
         )
         file_handler.setLevel(logging.DEBUG)
