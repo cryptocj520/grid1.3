@@ -521,9 +521,9 @@ class OrderHealthChecker:
         5. 安全检查和补单决策
         """
         try:
-            self.logger.debug("=" * 80)
+            self.logger.debug("<" * 80)
             self.logger.debug("🔍 开始执行订单和持仓健康检查")
-            self.logger.debug("=" * 80)
+            self.logger.debug("<" * 80)
 
             # ==================== 阶段0: 剥头皮模式检查 ====================
             # 🔥 如果剥头皮模式已激活，只进行诊断报告，不做任何修改操作
@@ -658,7 +658,80 @@ class OrderHealthChecker:
                         self.logger.warning(
                             f"⚠️ 二次验证: 持仓仍异常 - {', '.join(position_health['issues'])}"
                         )
-                    self.logger.debug("继续执行修复流程...")
+
+                    # 🔥 第三次验证机制：防止API查询失败误报
+                    # 如果订单数=0（买单=0且卖单=0），可能是API临时故障，需要第三次验证
+                    if second_order_count == 0 and buy_count == 0 and sell_count == 0:
+                        self.logger.warning(
+                            "🔴 二次验证发现订单数为0（买单=0，卖单=0）！\n"
+                            "   这可能是API查询失败的误报，而非真实情况\n"
+                            "   准备进行第三次验证以确认..."
+                        )
+
+                        # 等待3秒进行第三次验证
+                        self.logger.debug("⏰ 等待3秒后进行第三次验证...")
+                        await asyncio.sleep(3)
+
+                        # 第三次并发获取订单和持仓
+                        orders, positions = await self._fetch_orders_and_positions()
+                        third_order_count = len(orders)
+
+                        # 重新统计
+                        buy_count = sum(1 for o in orders if o.side ==
+                                        ExchangeOrderSide.BUY)
+                        sell_count = sum(1 for o in orders if o.side ==
+                                         ExchangeOrderSide.SELL)
+
+                        self.logger.warning(
+                            f"📡 第三次获取: 订单={third_order_count}个, "
+                            f"买单={buy_count}个, 卖单={sell_count}个, "
+                            f"持仓={len(positions)}个"
+                        )
+
+                        # 判断第三次验证结果
+                        if third_order_count > 0:
+                            # 第三次验证发现有订单，说明二次验证是误报
+                            self.logger.warning(
+                                f"✅ 第三次验证: 订单已恢复（{third_order_count}个）\n"
+                                f"   判定：二次验证时API查询失败，属于误报\n"
+                                f"   系统继续正常运行，不触发紧急停止"
+                            )
+
+                            # 重新计算预期持仓
+                            expected_position = self._calculate_expected_position(
+                                self.config.grid_count,
+                                buy_count,
+                                sell_count
+                            )
+
+                            # 重新检查持仓
+                            position_health = self._check_position_health(
+                                expected_position, positions)
+
+                            # 更新订单列表（用于后续流程）
+                            # 注意：这里已经是第三次查询的结果
+
+                        else:
+                            # 第三次验证仍为0，可能确实有严重问题
+                            self.logger.critical(
+                                f"🚨 第三次验证: 订单仍为0！\n"
+                                f"   连续3次查询均无订单，可能是严重问题\n"
+                                f"   将继续执行剥头皮持仓偏差检测"
+                            )
+
+                            # 重新计算预期持仓（基于0个订单）
+                            expected_position = self._calculate_expected_position(
+                                self.config.grid_count,
+                                buy_count,
+                                sell_count
+                            )
+
+                            # 重新检查持仓
+                            position_health = self._check_position_health(
+                                expected_position, positions)
+                    else:
+                        # 订单数不为0，继续正常流程
+                        self.logger.debug("继续执行修复流程...")
 
             # ==================== 阶段2.5: 剥头皮模式持仓偏差检测 ====================
             # 🆕 如果是剥头皮模式，检查持仓偏差是否严重
@@ -965,9 +1038,9 @@ class OrderHealthChecker:
             # ==================== 同步订单到本地缓存 ====================
             await self._sync_orders_to_engine(final_orders)
 
-            self.logger.debug("=" * 80)
+            self.logger.debug(">" * 80)
             self.logger.debug("✅ 订单和持仓健康检查完成")
-            self.logger.debug("=" * 80)
+            self.logger.debug(">" * 80)
 
         except Exception as e:
             self.logger.error(f"❌ 订单健康检查失败: {e}")

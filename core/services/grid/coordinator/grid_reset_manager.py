@@ -105,11 +105,13 @@ class GridResetManager:
             self.logger.warning("💰 开始执行止盈重置（锁定系统）...")
 
             # 执行通用重置工作流
+            # 🔥 对于价格移动网格，止盈重置时也应该更新价格区间
             new_capital = await self._generic_reset_workflow(
                 reset_type="止盈",
                 should_close_position=True,  # 需要平仓
                 should_reinit_capital=True,  # 需要重新初始化本金
-                continue_after_cancel_fail=False  # 取消失败则中止
+                continue_after_cancel_fail=False,  # 取消失败则中止
+                update_price_range=self.config.is_follow_mode()  # 价格移动网格时更新区间
             )
 
             if new_capital is None:

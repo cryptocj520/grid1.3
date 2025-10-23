@@ -66,7 +66,7 @@ class GridTerminalUI:
 
         title = Text()
         title.append("🎯 网格交易系统实时监控 ", style="bold cyan")
-        title.append("v2.6", style="bold magenta")
+        title.append("v2.7", style="bold magenta")
         title.append(" - ", style="bold white")
         title.append(
             f"{self.coordinator.config.exchange.upper()}/", style="bold yellow")
@@ -137,6 +137,14 @@ class GridTerminalUI:
             content.append(f"  |  触发次数: ", style="white")
             content.append(f"{stats.scalping_trigger_count}",
                            style="bold yellow")
+            # 🆕 显示触发网格和价格（从配置文件读取）
+            trigger_grid = self.coordinator.config.get_scalping_trigger_grid()
+            trigger_price = self.coordinator.config.get_grid_price(
+                trigger_grid)
+            content.append(f"  |  触发网格: ", style="white")
+            content.append(f"Grid {trigger_grid}", style="bold cyan")
+            content.append(f"  |  触发价格: ", style="white")
+            content.append(f"${trigger_price:,.4f}", style="bold cyan")
             content.append("\n")
 
         # 🛡️ 显示本金保护模式状态
