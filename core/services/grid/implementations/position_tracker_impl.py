@@ -74,12 +74,16 @@ class PositionTrackerImpl(IPositionTracker):
         修改说明：
         - 持仓数据：完全来自 position_monitor 的REST查询（sync_initial_position方法）
         - 交易历史：仍然通过此方法记录，用于终端UI显示"最近成交"
-        - 统计计数：买入/卖出次数统计
+        - 统计数据：买入/卖出次数、已实现盈亏、手续费（仅供显示）
 
         不再做的事：
         ❌ 不再更新 current_position（持仓由REST同步）
         ❌ 不再更新 average_cost（成本由REST同步）
-        ❌ 不再计算 realized_pnl（使用本金盈亏替代）
+        ❌ 不再更新 position_cost（由REST同步时计算）
+
+        仅用于显示：
+        ✅ realized_pnl（已实现盈亏统计）
+        ✅ total_fees（手续费统计）
 
         Args:
             order: 成交订单
@@ -91,7 +95,10 @@ class PositionTrackerImpl(IPositionTracker):
         filled_price = order.filled_price or order.price
         filled_amount = order.filled_amount or order.amount
 
-        # 🔥 只记录统计数据，不更新持仓
+        # 用于记录交易历史的盈亏
+        profit = None
+
+        # 🔥 统计计数和盈亏计算（仅用于显示）
         if order.is_buy_order():
             self.buy_count += 1
             self.logger.debug(
@@ -99,21 +106,42 @@ class PositionTrackerImpl(IPositionTracker):
             )
         else:
             self.sell_count += 1
-            self.logger.debug(
-                f"卖出记录: {filled_amount}@{filled_price}"
-            )
+
+            # 📊 计算已实现盈亏（仅用于统计显示，不影响业务逻辑）
+            # 使用REST同步的average_cost来计算
+            if self.current_position > 0 and self.average_cost > 0:
+                # 做多网格的卖出，计算盈亏
+                sell_cost = self.average_cost * filled_amount
+                sell_value = filled_price * filled_amount
+                profit = sell_value - sell_cost
+                self.realized_pnl += profit
+
+                self.logger.debug(
+                    f"卖出记录: {filled_amount}@{filled_price}, "
+                    f"成本: {self.average_cost}, 盈亏: {profit}"
+                )
+            elif self.current_position < 0 and self.average_cost > 0:
+                # 做空网格的卖出（建仓），暂不计算盈亏
+                self.logger.debug(
+                    f"做空卖出记录: {filled_amount}@{filled_price}"
+                )
+
+        # 📊 计算手续费（仅用于统计显示）
+        fee = filled_price * filled_amount * self.config.fee_rate
+        self.total_fees += fee
 
         # 更新完成循环次数
         self.completed_cycles = min(self.buy_count, self.sell_count)
 
         # 🔥 记录交易历史（用于终端UI显示）
-        self._record_trade(order, filled_price, filled_amount, profit=None)
+        self._record_trade(order, filled_price, filled_amount, profit)
 
         # 更新最后交易时间
         self.last_trade_time = datetime.now()
 
         self.logger.info(
-            f"记录成交: {order.side.value} {filled_amount}@{filled_price} "
+            f"记录成交: {order.side.value} {filled_amount}@{filled_price}, "
+            f"已实现盈亏: {self.realized_pnl}, 手续费: {self.total_fees} "
             f"(持仓由REST同步)"
         )
 
