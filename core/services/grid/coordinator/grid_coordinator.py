@@ -311,7 +311,9 @@ class GridCoordinator:
                 filled_order.filled_amount or filled_order.amount
             )
 
-            # 2. 记录到持仓跟踪器
+            # 🔥 2. 记录交易历史（不影响持仓，只用于统计和显示）
+            # 持仓数据完全来自 position_monitor 的REST查询
+            # 此方法只记录交易历史和统计，不更新持仓
             self.tracker.record_filled_order(filled_order)
 
             # 🔥 3. 检查剥头皮模式（使用新模块）
@@ -431,6 +433,7 @@ class GridCoordinator:
                     order.filled_price,
                     order.filled_amount or order.amount
                 )
+                # 🔥 记录交易历史（不影响持仓）
                 self.tracker.record_filled_order(order)
 
             # 2. 批量计算反向订单

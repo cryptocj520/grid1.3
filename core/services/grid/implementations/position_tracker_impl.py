@@ -69,7 +69,17 @@ class PositionTrackerImpl(IPositionTracker):
 
     def record_filled_order(self, order: GridOrder):
         """
-        记录成交订单
+        🔥 记录订单成交（仅用于交易历史和统计，不更新持仓）
+
+        修改说明：
+        - 持仓数据：完全来自 position_monitor 的REST查询（sync_initial_position方法）
+        - 交易历史：仍然通过此方法记录，用于终端UI显示"最近成交"
+        - 统计计数：买入/卖出次数统计
+
+        不再做的事：
+        ❌ 不再更新 current_position（持仓由REST同步）
+        ❌ 不再更新 average_cost（成本由REST同步）
+        ❌ 不再计算 realized_pnl（使用本金盈亏替代）
 
         Args:
             order: 成交订单
@@ -81,72 +91,30 @@ class PositionTrackerImpl(IPositionTracker):
         filled_price = order.filled_price or order.price
         filled_amount = order.filled_amount or order.amount
 
-        # 更新持仓
+        # 🔥 只记录统计数据，不更新持仓
         if order.is_buy_order():
-            # 买单：增加持仓
-            self.position_cost += filled_price * filled_amount
-            self.current_position += filled_amount
             self.buy_count += 1
-
             self.logger.debug(
-                f"买入: {filled_amount}@{filled_price}, "
-                f"持仓: {self.current_position}"
+                f"买入记录: {filled_amount}@{filled_price}"
             )
         else:
-            # 卖单：减少持仓，计算已实现盈亏
-            if self.current_position > 0:
-                # 计算这笔卖出对应的成本
-                avg_cost = self.position_cost / \
-                    self.current_position if self.current_position > 0 else Decimal(
-                        '0')
-                sell_cost = avg_cost * filled_amount
-                sell_value = filled_price * filled_amount
-
-                # 已实现盈亏
-                profit = sell_value - sell_cost
-                self.realized_pnl += profit
-
-                # 更新持仓成本
-                self.position_cost -= sell_cost
-                self.current_position -= filled_amount
-
-                self.logger.debug(
-                    f"卖出: {filled_amount}@{filled_price}, "
-                    f"成本: {avg_cost}, 盈亏: {profit}, "
-                    f"持仓: {self.current_position}"
-                )
-            else:
-                # 如果是做空，持仓为负（建仓卖单）
-                self.position_cost -= filled_price * filled_amount
-                self.current_position -= filled_amount
-                profit = Decimal('0')  # 做空建仓时没有盈亏
-
             self.sell_count += 1
-
-        # 更新平均成本
-        if self.current_position != 0:
-            self.average_cost = self.position_cost / abs(self.current_position)
-        else:
-            self.average_cost = Decimal('0')
-
-        # 计算手续费（使用配置的手续费率）
-        fee = filled_price * filled_amount * self.config.fee_rate
-        self.total_fees += fee
+            self.logger.debug(
+                f"卖出记录: {filled_amount}@{filled_price}"
+            )
 
         # 更新完成循环次数
         self.completed_cycles = min(self.buy_count, self.sell_count)
 
-        # 记录交易历史
-        # 买单没有profit，使用None；卖单使用计算的profit
-        self._record_trade(order, filled_price, filled_amount,
-                           profit if order.is_sell_order() else None)
+        # 🔥 记录交易历史（用于终端UI显示）
+        self._record_trade(order, filled_price, filled_amount, profit=None)
 
         # 更新最后交易时间
         self.last_trade_time = datetime.now()
 
         self.logger.info(
-            f"记录成交: {order.side.value} {filled_amount}@{filled_price}, "
-            f"持仓: {self.current_position}, 已实现盈亏: {self.realized_pnl}"
+            f"记录成交: {order.side.value} {filled_amount}@{filled_price} "
+            f"(持仓由REST同步)"
         )
 
     def _record_trade(self, order: GridOrder, price: Decimal, amount: Decimal, profit: Decimal = None):
@@ -392,10 +360,23 @@ class PositionTrackerImpl(IPositionTracker):
 
     def sync_initial_position(self, position: Decimal, entry_price: Decimal):
         """
-        同步初始持仓（系统启动时从交易所获取）
+        🔥 同步持仓（持仓数据的唯一来源）
+
+        从REST API查询的交易所实际持仓同步到tracker。
+        这是更新tracker持仓的唯一方法，不再通过WebSocket订单成交事件更新。
+
+        数据流：
+        1. position_monitor每秒通过REST API查询交易所持仓
+        2. 调用此方法将结果同步到tracker
+        3. 所有模块从tracker读取持仓数据
+
+        优点：
+        - 持仓数据100%准确（来自交易所）
+        - 避免WebSocket和REST两个数据源冲突
+        - 消除竞态条件
 
         Args:
-            position: 初始持仓数量（正数=多仓，负数=空仓）
+            position: 持仓数量（正数=多仓，负数=空仓）
             entry_price: 平均入场价格
         """
         old_position = self.current_position

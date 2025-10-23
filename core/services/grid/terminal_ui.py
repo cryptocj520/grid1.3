@@ -66,7 +66,7 @@ class GridTerminalUI:
 
         title = Text()
         title.append("🎯 网格交易系统实时监控 ", style="bold cyan")
-        title.append("v2.7", style="bold magenta")
+        title.append("v2.8", style="bold magenta")
         title.append(" - ", style="bold white")
         title.append(
             f"{self.coordinator.config.exchange.upper()}/", style="bold yellow")
@@ -529,10 +529,6 @@ class GridTerminalUI:
         position_color = "green" if stats.current_position > 0 else "red" if stats.current_position < 0 else "white"
         position_type = "做多" if stats.current_position > 0 else "做空" if stats.current_position < 0 else "空仓"
 
-        # 未实现盈亏颜色
-        unrealized_color = "green" if stats.unrealized_profit > 0 else "red" if stats.unrealized_profit < 0 else "white"
-        unrealized_sign = "+" if stats.unrealized_profit > 0 else ""
-
         content = Text()
         content.append(f"├─ 当前持仓: ", style="white")
         content.append(
@@ -619,12 +615,7 @@ class GridTerminalUI:
         content.append(
             f"订单冻结: ${stats.order_locked_balance:,.2f} USDC\n", style="white")
 
-        # 未实现盈亏（始终显示）
-        content.append(f"├─ 未实现盈亏: ", style="white")
-        content.append(f"{unrealized_sign}${stats.unrealized_profit:,.2f} ",
-                       style=f"bold {unrealized_color}")
-        content.append(f"({unrealized_sign}{stats.unrealized_profit/abs(stats.current_position * stats.current_price) * 100 if stats.current_position != 0 else 0:.2f}%)\n",
-                       style=unrealized_color)
+        # 🔥 未实现盈亏已删除（重复显示，盈亏统计面板中已有）
 
         # 🆕 爆仓风险提示（仅作为风险提示，无实质功能）
         liquidation_price, distance_percent, risk_level = self._calculate_liquidation_price(

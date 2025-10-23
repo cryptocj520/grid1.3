@@ -132,6 +132,8 @@ class PositionMonitor:
                 # 无持仓
                 if is_initial or self._last_position_size != Decimal('0'):
                     self.logger.info("📊 REST查询: 当前无持仓")
+                    # 🔥 持仓数据的唯一来源：REST API查询结果
+                    # tracker不再通过WebSocket订单成交事件更新持仓
                     self.tracker.sync_initial_position(
                         position=Decimal('0'),
                         entry_price=Decimal('0')
@@ -168,7 +170,8 @@ class PositionMonitor:
             if not is_initial:
                 await self._check_position_anomaly(position_qty)
 
-            # 更新持仓追踪器
+            # 🔥 更新持仓追踪器（持仓数据的唯一来源）
+            # 所有持仓数据都来自REST API，不再使用WebSocket成交事件更新
             self.tracker.sync_initial_position(
                 position=position_qty,
                 entry_price=position.entry_price
