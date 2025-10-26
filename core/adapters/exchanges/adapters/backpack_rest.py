@@ -238,6 +238,14 @@ class BackpackRest(BackpackBase):
         elif endpoint == '/api/v1/ticker':
             return 'marketdataQuery'
 
+        # 历史查询（History API）
+        elif endpoint == '/wapi/v1/history/fills':
+            if upper_method == 'GET':
+                return 'fillHistoryQueryAll'
+        elif endpoint == '/wapi/v1/history/orders':
+            if upper_method == 'GET':
+                return 'orderHistoryQueryAll'
+
         # 未知端点使用默认生成的指令类型
         if self.logger:
             self.logger.warning(f"未知的API端点: {method} {endpoint}，使用默认指令类型")
@@ -811,9 +819,129 @@ class BackpackRest(BackpackBase):
         since: Optional[datetime] = None,
         limit: Optional[int] = None
     ) -> List[TradeData]:
-        """获取成交数据"""
-        # TODO: 实现成交数据获取
-        return []
+        """
+        获取用户成交记录（私有API）
+
+        Args:
+            symbol: 交易对符号 (如 'BTC_USDC_PERP')
+            since: 开始时间
+            limit: 返回数量限制
+
+        Returns:
+            List[TradeData]: 成交记录列表
+        """
+        try:
+            # 🔥 Backpack History API 使用原始 symbol 格式
+            # 永续合约: BTC_USDC_PERP (保留 _PERP 后缀)
+            # 现货: BTC_USDC
+            # 经过实际测试验证：API 返回的 symbol 就是 BTC_USDC_PERP
+            mapped_symbol = symbol
+
+            # 转换时间戳
+            since_timestamp = int(since.timestamp() * 1000) if since else None
+
+            # 调用API获取原始数据
+            trades_data = await self.fetch_trades(
+                mapped_symbol,
+                since=since_timestamp,
+                limit=limit
+            )
+
+            # 解析为TradeData对象
+            result = []
+            for trade in trades_data:
+                try:
+                    trade_data = self._parse_trade(trade, symbol)
+                    result.append(trade_data)
+                except Exception as e:
+                    if self.logger:
+                        self.logger.warning(f"解析成交记录失败: {e}, 原始数据: {trade}")
+                    continue
+
+            return result
+
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"获取成交记录失败 {symbol}: {e}")
+            return []
+
+    def _parse_trade(self, trade: Dict[str, Any], symbol: str) -> TradeData:
+        """
+        解析Backpack成交记录
+
+        Backpack API 返回格式示例（实际测试）:
+        {
+            "tradeId": 35412870,                       # 成交ID
+            "orderId": "15106947971",                  # 订单ID  
+            "symbol": "BTC_USDC_PERP",                 # 交易对（永续合约保留_PERP）
+            "side": "Ask",                             # 方向: Bid/Ask
+            "price": "111409.6",                       # 成交价格
+            "quantity": "0.00804",                     # 成交数量
+            "fee": "0.232891",                         # 手续费
+            "feeSymbol": "USDC",                       # 手续费币种
+            "timestamp": "2025-10-24T13:05:14.548",    # ISO 8601 时间戳
+            "isMaker": false,                          # 是否 Maker
+            "clientId": null,                          # 客户端ID
+            "systemOrderType": null                    # 系统订单类型
+        }
+        """
+        try:
+            # 解析方向
+            side_str = trade.get('side', '').lower()
+            if side_str == 'bid' or side_str == 'buy':
+                side = OrderSide.BUY
+            elif side_str == 'ask' or side_str == 'sell':
+                side = OrderSide.SELL
+            else:
+                side = OrderSide.BUY  # 默认
+
+            # 解析价格和数量
+            price = Decimal(str(trade.get('price', 0)))
+            amount = Decimal(str(trade.get('quantity', 0)))
+            cost = Decimal(str(trade.get('quoteQuantity', 0)))
+
+            # 解析手续费
+            fee_amount = trade.get('fee')
+            fee_symbol = trade.get('feeSymbol', 'USDC')
+            fee = {
+                'cost': Decimal(str(fee_amount)) if fee_amount else Decimal('0'),
+                'currency': fee_symbol
+            } if fee_amount else None
+
+            # 解析时间戳（支持两种格式）
+            timestamp_value = trade.get('timestamp')
+            if timestamp_value:
+                if isinstance(timestamp_value, str):
+                    # ISO 8601 格式: "2025-10-24T13:05:14.548"
+                    timestamp = datetime.fromisoformat(
+                        timestamp_value.replace('Z', '+00:00'))
+                elif isinstance(timestamp_value, (int, float)):
+                    # 毫秒时间戳格式: 1729767891574
+                    timestamp = datetime.fromtimestamp(timestamp_value / 1000)
+                else:
+                    timestamp = datetime.now()
+            else:
+                timestamp = datetime.now()
+
+            # 创建TradeData对象
+            return TradeData(
+                # tradeId 或 id
+                id=str(trade.get('tradeId', trade.get('id', ''))),
+                symbol=symbol,
+                side=side,
+                amount=amount,
+                price=price,
+                cost=cost,
+                fee=fee,
+                timestamp=timestamp,
+                order_id=str(trade.get('orderId', '')),
+                raw_data=trade
+            )
+
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"解析成交记录失败: {e}, 数据: {trade}")
+            raise
 
     # === 账户接口 ===
 
@@ -1068,6 +1196,71 @@ class BackpackRest(BackpackBase):
             raw_data=data
         )
 
+    def _parse_timestamp(self, timestamp_value: Any) -> Optional[datetime]:
+        """
+        解析时间戳（支持多种格式）
+
+        Backpack API 返回格式:
+        - ISO 8601 字符串: "2025-10-24T13:49:48.045"
+        - 毫秒时间戳: 1729768293700
+
+        Returns:
+            datetime 对象，或 None（如果解析失败）
+        """
+        if not timestamp_value:
+            return None
+
+        try:
+            if isinstance(timestamp_value, str):
+                # ISO 8601 格式: "2025-10-24T13:49:48.045"
+                return datetime.fromisoformat(timestamp_value.replace('Z', '+00:00'))
+            elif isinstance(timestamp_value, (int, float)):
+                # 毫秒时间戳格式: 1729768293700
+                return datetime.fromtimestamp(timestamp_value / 1000)
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"时间戳解析失败: {timestamp_value}, 错误: {e}")
+
+        return None
+
+    def _calculate_average_price(self, order_data: Dict[str, Any]) -> Optional[Decimal]:
+        """
+        智能计算订单平均成交价格
+
+        Backpack API 返回格式:
+        - avgPrice: 直接返回的平均价格（某些端点有）
+        - executedQuoteQuantity: 成交总金额
+        - executedQuantity: 成交数量
+
+        优先级:
+        1. avgPrice（如果存在）
+        2. executedQuoteQuantity / executedQuantity（计算）
+        3. None
+        """
+        # 🔥 优先使用 avgPrice
+        avg_price = order_data.get('avgPrice')
+        if avg_price:
+            return self._safe_decimal(avg_price)
+
+        # 🔥 如果没有 avgPrice，从成交金额和数量计算
+        executed_quote = order_data.get('executedQuoteQuantity')
+        executed_qty = order_data.get('executedQuantity')
+
+        if executed_quote and executed_qty:
+            try:
+                quote_decimal = self._safe_decimal(executed_quote)
+                qty_decimal = self._safe_decimal(executed_qty)
+
+                if quote_decimal and qty_decimal and qty_decimal > 0:
+                    # 计算平均价格 = 成交金额 / 成交数量
+                    avg_price_calc = quote_decimal / qty_decimal
+                    return avg_price_calc
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"计算平均价格失败: {e}")
+
+        return None
+
     def _parse_order(self, data: Dict[str, Any]) -> OrderData:
         """解析订单数据（Backpack格式）"""
         # 如果直接返回状态字符串，说明创建订单成功但只返回了状态
@@ -1135,13 +1328,11 @@ class BackpackRest(BackpackBase):
             filled=executed_quantity,
             remaining=remaining,
             cost=self._safe_decimal(data.get('executedQuoteQuantity')),
-            average=self._safe_decimal(
-                data.get('avgPrice')) if data.get('avgPrice') else None,
+            average=self._calculate_average_price(data),  # 🔥 智能计算平均价格
             status=status,
-            timestamp=datetime.fromtimestamp(int(
-                data.get('createdAt', 0)) / 1000) if data.get('createdAt') else datetime.now(),
-            updated=datetime.fromtimestamp(
-                int(data.get('updatedAt', 0)) / 1000) if data.get('updatedAt') else None,
+            timestamp=self._parse_timestamp(
+                data.get('createdAt')) or datetime.now(),
+            updated=self._parse_timestamp(data.get('updatedAt')),
             fee=None,
             trades=[],
             params={},
@@ -1417,12 +1608,82 @@ class BackpackRest(BackpackBase):
         since: Optional[datetime] = None,
         limit: Optional[int] = None
     ) -> List[OrderData]:
-        """获取历史订单 - Backpack API暂不支持此功能"""
-        # 注意：根据测试结果，/api/v1/history/orders 端点返回404
-        # Backpack API可能不支持历史订单查询功能
-        if self.logger:
-            self.logger.warning("Backpack API暂不支持历史订单查询")
-        return []
+        """
+        获取历史订单（包括已完全成交的订单）
+
+        使用 /wapi/v1/history/orders 端点
+
+        Args:
+            symbol: 交易对（可选）
+            since: 开始时间（可选）
+            limit: 限制数量（默认100，最大1000）
+
+        Returns:
+            历史订单列表
+
+        注意：
+        - 使用 /wapi/v1/history/orders（不是 /api/v1/history/orders）
+        - 返回的订单包含 avgPrice（平均成交价）
+        - 适合查询已完全成交的市价订单
+        """
+        try:
+            params = {}
+
+            # 🔥 symbol 参数（必填）
+            if symbol:
+                params['symbol'] = self._map_symbol(symbol)
+
+            # 时间范围（可选）
+            if since:
+                # 转换为毫秒时间戳
+                params['startTime'] = int(since.timestamp() * 1000)
+
+            # 限制数量（可选，默认100，最大1000）
+            if limit:
+                params['limit'] = min(limit, 1000)
+
+            # 🔥 调用新的 /wapi/v1/history/orders 端点
+            result = await self._make_authenticated_request(
+                'GET',
+                '/wapi/v1/history/orders',
+                params=params
+            )
+
+            # 解析订单列表
+            if isinstance(result, list):
+                if self.logger:
+                    self.logger.info(f"🔍 原始API返回 {len(result)} 条订单")
+
+                orders = []
+                for i, order_data in enumerate(result, 1):
+                    try:
+                        # 使用现有的 _parse_order 方法
+                        order = self._parse_order(order_data)
+                        orders.append(order)
+                        if self.logger and i <= 3:  # 只打印前3条
+                            self.logger.debug(
+                                f"✅ 订单 {i} 解析成功 - ID: {order.id}, "
+                                f"Status: {order.status.value}, Average: {order.average}")
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.error(f"❌ 解析订单 {i} 失败: {e}")
+                            self.logger.error(f"   订单数据: {order_data}")
+                        import traceback
+                        if self.logger:
+                            self.logger.error(traceback.format_exc())
+
+                if self.logger:
+                    self.logger.info(
+                        f"✅ 成功解析 {len(orders)}/{len(result)} 条历史订单")
+
+                return orders
+
+            return []
+
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"获取历史订单失败: {e}")
+            return []
 
     # === 设置接口 ===
 
@@ -1618,20 +1879,35 @@ class BackpackRest(BackpackBase):
                 self.logger.warning(f"获取orderbook数据失败 {symbol}: {e}")
             raise
 
-    async def fetch_trades(self, symbol: str, since: Optional[int] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """获取交易历史原始数据"""
+    async def fetch_trades(self, symbol: Optional[str] = None, since: Optional[int] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        获取用户成交历史（私有API）
+
+        参考文档: https://docs.backpack.exchange/#tag/History/operation/get_fill_history
+        使用 /wapi/v1/history/fills 获取用户成交记录
+
+        API 参数:
+        - symbol: 交易对符号 (可选，不传则获取所有)
+        - startTime: 开始时间戳(毫秒) (可选)
+        - endTime: 结束时间戳(毫秒) (可选)
+        - limit: 返回数量限制，默认500 (可选)
+        """
         try:
-            params = {"symbol": symbol}
+            params = {}
+            if symbol:
+                params["symbol"] = symbol
             if since:
-                params["since"] = since
+                params["startTime"] = since  # 开始时间戳（毫秒）
             if limit:
                 params["limit"] = limit
 
-            data = await self._make_authenticated_request("GET", "/api/v1/trades", params=params)
-            return data.get('trades', [])
+            # 🔥 使用 /wapi/v1/history/fills 获取用户成交记录
+            data = await self._make_authenticated_request("GET", "/wapi/v1/history/fills", params=params)
+            return data if isinstance(data, list) else []
         except Exception as e:
             if self.logger:
-                self.logger.warning(f"获取trades数据失败 {symbol}: {e}")
+                self.logger.warning(
+                    f"获取fills数据失败 {symbol if symbol else 'all'}: {e}")
             raise
 
     async def get_klines(self, symbol: str, interval: str, since: Optional[datetime] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
