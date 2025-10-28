@@ -1177,6 +1177,12 @@ class BackpackWebSocket(BackpackBase):
                     self.logger.warning(f"🚫 跳过黑名单交易对: {symbol}")
                 return
 
+            # 🔥 移除旧的同类型订阅，避免重复回调
+            self._ws_subscriptions = [
+                (sub_type, sym, cb) for sub_type, sym, cb in self._ws_subscriptions
+                if not (sub_type == 'ticker' and sym == symbol)
+            ]
+
             self._ws_subscriptions.append(('ticker', symbol, callback))
 
             # 修复：单独订阅时也要添加到_subscribed_symbols
@@ -1210,6 +1216,12 @@ class BackpackWebSocket(BackpackBase):
                     self.logger.warning(f"🚫 跳过黑名单交易对: {symbol}")
                 return
 
+            # 🔥 移除旧的同类型订阅，避免重复回调
+            self._ws_subscriptions = [
+                (sub_type, sym, cb) for sub_type, sym, cb in self._ws_subscriptions
+                if not (sub_type == 'orderbook' and sym == symbol)
+            ]
+
             self._ws_subscriptions.append(('orderbook', symbol, callback))
 
             # 修复：单独订阅时也要添加到_subscribed_symbols
@@ -1242,6 +1254,12 @@ class BackpackWebSocket(BackpackBase):
                 if self.logger:
                     self.logger.warning(f"🚫 跳过黑名单交易对: {symbol}")
                 return
+
+            # 🔥 移除旧的同类型订阅，避免重复回调
+            self._ws_subscriptions = [
+                (sub_type, sym, cb) for sub_type, sym, cb in self._ws_subscriptions
+                if not (sub_type == 'trades' and sym == symbol)
+            ]
 
             self._ws_subscriptions.append(('trades', symbol, callback))
 
@@ -1302,6 +1320,13 @@ class BackpackWebSocket(BackpackBase):
         - https://docs.backpack.exchange/#tag/Streams/Private/Position-update
         """
         try:
+            # 🔥 移除旧的 user_data 订阅，避免重复回调
+            self._ws_subscriptions = [
+                (sub_type, symbol, cb) for sub_type, symbol, cb in self._ws_subscriptions
+                if sub_type != 'user_data'
+            ]
+
+            # 添加新的订阅
             self._ws_subscriptions.append(('user_data', None, callback))
             self.user_data_callback = callback
 

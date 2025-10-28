@@ -12,7 +12,7 @@ from decimal import Decimal
 
 from .hyperliquid_base import HyperliquidBase
 from ..models import (
-    TickerData, OrderBookData, TradeData, BalanceData, PositionData, 
+    TickerData, OrderBookData, TradeData, BalanceData, PositionData,
     OrderData, OHLCVData, ExchangeInfo, OrderBookLevel,
     OrderSide, OrderType, OrderStatus, PositionSide, MarginMode, ExchangeType
 )
@@ -27,7 +27,7 @@ class HyperliquidRest(HyperliquidBase):
         self.exchange: Optional[ccxt.hyperliquid] = None
         self.max_retries = 3
         self.retry_delay = 1.0
-        
+
     async def connect(self) -> bool:
         """建立连接"""
         try:
@@ -42,7 +42,7 @@ class HyperliquidRest(HyperliquidBase):
             # 🔥 修复：Hyperliquid使用privateKey和walletAddress认证
             if self.config and self.config.api_key:
                 exchange_config['privateKey'] = self.config.api_key
-                
+
                 # 如果有钱包地址，添加到配置
                 if self.config.wallet_address:
                     exchange_config['walletAddress'] = self.config.wallet_address
@@ -55,21 +55,25 @@ class HyperliquidRest(HyperliquidBase):
             )
 
             if self.logger:
-                auth_mode = "认证模式" if (self.config and self.config.api_key) else "公共访问模式"
-                self.logger.info(f"Hyperliquid REST连接成功 ({auth_mode})，加载 {len(self.exchange.markets)} 个市场")
-                
+                auth_mode = "认证模式" if (
+                    self.config and self.config.api_key) else "公共访问模式"
+                self.logger.info(
+                    f"Hyperliquid REST连接成功 ({auth_mode})，加载 {len(self.exchange.markets)} 个市场")
+
                 # 🔍 调试：打印一些实际的符号格式以了解正确格式
                 if self.exchange.markets:
                     sample_symbols = list(self.exchange.markets.keys())[:10]
-                    self.logger.info(f"🔍 Hyperliquid实际符号格式示例: {sample_symbols}")
-                    
+                    self.logger.info(
+                        f"🔍 Hyperliquid实际符号格式示例: {sample_symbols}")
+
                     # 特别检查SOL相关的符号
-                    sol_symbols = [s for s in self.exchange.markets.keys() if 'SOL' in s.upper()][:5]
+                    sol_symbols = [
+                        s for s in self.exchange.markets.keys() if 'SOL' in s.upper()][:5]
                     if sol_symbols:
                         self.logger.info(f"🔍 SOL相关符号: {sol_symbols}")
                     else:
                         self.logger.warning("⚠️  未找到SOL相关符号")
-            
+
             return True
 
         except Exception as e:
@@ -86,27 +90,34 @@ class HyperliquidRest(HyperliquidBase):
                 self.logger.info("Hyperliquid REST连接已断开")
 
     async def _execute_with_retry(self, func, *args, operation_name=None, **kwargs):
-        """带重试的API调用"""
+        """带重试的API调用 - 支持 async 和同步函数"""
         last_error = None
-        
+
         for attempt in range(self.max_retries):
             try:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, func, *args, **kwargs
-                )
+                # 🔥 检查是否是协程函数
+                if asyncio.iscoroutinefunction(func):
+                    # 如果是 async 函数，直接await
+                    result = await func(*args, **kwargs)
+                else:
+                    # 如果是同步函数，在 executor 中运行
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: func(*args, **kwargs)
+                    )
                 return result
             except Exception as e:
                 last_error = e
                 if attempt < self.max_retries - 1:
                     operation = operation_name or func.__name__
                     if self.logger:
-                        self.logger.warning(f"{operation} API调用失败 (尝试 {attempt + 1}/{self.max_retries}): {str(e)}")
+                        self.logger.warning(
+                            f"{operation} API调用失败 (尝试 {attempt + 1}/{self.max_retries}): {str(e)}")
                     await asyncio.sleep(self.retry_delay * (attempt + 1))
                 else:
                     operation = operation_name or func.__name__
                     if self.logger:
                         self.logger.error(f"{operation} API调用最终失败: {str(e)}")
-        
+
         raise last_error
 
     # === 市场数据API ===
@@ -155,7 +166,8 @@ class HyperliquidRest(HyperliquidBase):
             )
 
             return [
-                self._parse_ticker(ticker_data, self.reverse_map_symbol(market_symbol))
+                self._parse_ticker(
+                    ticker_data, self.reverse_map_symbol(market_symbol))
                 for market_symbol, ticker_data in tickers_data.items()
             ]
 
@@ -245,13 +257,14 @@ class HyperliquidRest(HyperliquidBase):
         # 处理不同的数据格式，过滤掉非余额项
         result = []
         # 过滤掉系统字段
-        excluded_keys = {'info', 'timestamp', 'datetime', 'free', 'used', 'total'}
-        
+        excluded_keys = {'info', 'timestamp',
+                         'datetime', 'free', 'used', 'total'}
+
         for currency, balance_info in balance_data.items():
             # 跳过系统字段
             if currency in excluded_keys:
                 continue
-                
+
             # 根据实际数据格式处理
             if isinstance(balance_info, dict):
                 # 字典格式，检查total
@@ -344,7 +357,8 @@ class HyperliquidRest(HyperliquidBase):
 
         orders = []
         for order_data in orders_data:
-            order = self._parse_order(order_data, symbol or order_data.get('symbol', ''))
+            order = self._parse_order(
+                order_data, symbol or order_data.get('symbol', ''))
             orders.append(order)
 
         return orders
@@ -378,7 +392,8 @@ class HyperliquidRest(HyperliquidBase):
             )
 
         return [
-            self._parse_order(order_data, symbol or self.reverse_map_symbol(order_data.get('symbol', '')))
+            self._parse_order(order_data, symbol or self.reverse_map_symbol(
+                order_data.get('symbol', '')))
             for order_data in orders_data
         ]
 
@@ -405,7 +420,8 @@ class HyperliquidRest(HyperliquidBase):
         )
 
         return [
-            self._parse_order(order_data, symbol or self.reverse_map_symbol(order_data.get('symbol', '')))
+            self._parse_order(order_data, symbol or self.reverse_map_symbol(
+                order_data.get('symbol', '')))
             for order_data in orders_data
         ]
 
@@ -444,10 +460,10 @@ class HyperliquidRest(HyperliquidBase):
         # 确保连接已建立
         if not self.exchange:
             await self.connect()
-        
+
         if not self.exchange:
             raise Exception("无法建立Hyperliquid连接")
-        
+
         return await asyncio.get_event_loop().run_in_executor(
             None, self.exchange.fetch_ticker, symbol
         )
@@ -457,10 +473,10 @@ class HyperliquidRest(HyperliquidBase):
         # 确保连接已建立
         if not self.exchange:
             await self.connect()
-        
+
         if not self.exchange:
             raise Exception("无法建立Hyperliquid连接")
-        
+
         return await asyncio.get_event_loop().run_in_executor(
             None, self.exchange.fetch_tickers
         )
@@ -470,10 +486,10 @@ class HyperliquidRest(HyperliquidBase):
         # 确保连接已建立
         if not self.exchange:
             await self.connect()
-        
+
         if not self.exchange:
             raise Exception("无法建立Hyperliquid连接")
-        
+
         return await asyncio.get_event_loop().run_in_executor(
             None, self.exchange.fetch_order_book, symbol, limit
         )
@@ -512,7 +528,7 @@ class HyperliquidRest(HyperliquidBase):
         # 临时切换到swap类型
         original_type = self.exchange.options.get('defaultType', 'spot')
         self.exchange.options['defaultType'] = 'swap'
-        
+
         try:
             balance = await asyncio.get_event_loop().run_in_executor(
                 None, self.exchange.fetch_balance
@@ -620,7 +636,7 @@ class HyperliquidRest(HyperliquidBase):
     def _parse_ticker(self, ticker_data: Dict[str, Any], symbol: str) -> TickerData:
         """解析行情数据"""
         from datetime import datetime
-        
+
         return TickerData(
             symbol=symbol,
             # === 基础价格信息 ===
@@ -633,55 +649,58 @@ class HyperliquidRest(HyperliquidBase):
             high=self._safe_decimal(ticker_data.get('high')),
             low=self._safe_decimal(ticker_data.get('low')),
             close=self._safe_decimal(ticker_data.get('close')),
-            
+
             # === 成交量信息 ===
             volume=self._safe_decimal(ticker_data.get('baseVolume')),
             quote_volume=self._safe_decimal(ticker_data.get('quoteVolume')),
             trades_count=ticker_data.get('count'),
-            
+
             # === 价格变化信息 ===
             change=self._safe_decimal(ticker_data.get('change')),
             percentage=self._safe_decimal(ticker_data.get('percentage')),
-            
+
             # === 合约特有信息（期货/永续合约） ===
             funding_rate=None,  # Hyperliquid需要单独获取
             predicted_funding_rate=None,
             funding_time=None,
             next_funding_time=None,
             funding_interval=None,
-            
+
             # === 价格参考信息 ===
             index_price=None,   # Hyperliquid需要单独获取
             mark_price=None,
             oracle_price=None,
-            
+
             # === 持仓和合约信息 ===
-            open_interest=None, # Hyperliquid需要单独获取
+            open_interest=None,  # Hyperliquid需要单独获取
             open_interest_value=None,
             delivery_date=None,
-            
+
             # === 时间相关信息 ===
             high_time=None,
             low_time=None,
             start_time=None,
             end_time=None,
-            
+
             # === 合约标识信息 ===
             contract_id=None,
             contract_name=symbol,
             base_currency=symbol.split('/')[0] if '/' in symbol else None,
-            quote_currency=symbol.split('/')[1].split(':')[0] if '/' in symbol and ':' in symbol else None,
+            quote_currency=symbol.split(
+                '/')[1].split(':')[0] if '/' in symbol and ':' in symbol else None,
             contract_size=None,
             tick_size=None,
             lot_size=None,
-            
+
             # === 时间戳链条 ===
-            timestamp=self._safe_parse_timestamp(ticker_data.get('timestamp')) or datetime.now(),
-            exchange_timestamp=self._safe_parse_timestamp(ticker_data.get('timestamp')),
+            timestamp=self._safe_parse_timestamp(
+                ticker_data.get('timestamp')) or datetime.now(),
+            exchange_timestamp=self._safe_parse_timestamp(
+                ticker_data.get('timestamp')),
             received_timestamp=datetime.now(),
             processed_timestamp=None,
             sent_timestamp=None,
-            
+
             # === 原始数据保留 ===
             raw_data=ticker_data
         )
@@ -691,16 +710,16 @@ class HyperliquidRest(HyperliquidBase):
         try:
             if timestamp_value is None:
                 return datetime.now()
-            
+
             if isinstance(timestamp_value, (int, float)):
                 # 如果是毫秒时间戳，转换为秒
                 if timestamp_value > 1e10:  # 毫秒级时间戳
                     return datetime.fromtimestamp(timestamp_value / 1000)
                 else:  # 秒级时间戳
                     return datetime.fromtimestamp(timestamp_value)
-            
+
             return datetime.now()
-            
+
         except (ValueError, TypeError, OverflowError):
             return datetime.now()
 
@@ -726,7 +745,8 @@ class HyperliquidRest(HyperliquidBase):
             symbol=symbol,
             bids=bids,
             asks=asks,
-            timestamp=self._safe_parse_timestamp(orderbook_data.get('timestamp')),
+            timestamp=self._safe_parse_timestamp(
+                orderbook_data.get('timestamp')),
             nonce=orderbook_data.get('nonce'),
             raw_data=orderbook_data
         )
@@ -736,7 +756,8 @@ class HyperliquidRest(HyperliquidBase):
         return OHLCVData(
             symbol=symbol,
             timeframe=timeframe,
-            timestamp=self._safe_parse_timestamp(candle[0]) if candle else datetime.now(),
+            timestamp=self._safe_parse_timestamp(
+                candle[0]) if candle else datetime.now(),
             open=self._safe_decimal(candle[1]) if len(candle) > 1 else None,
             high=self._safe_decimal(candle[2]) if len(candle) > 2 else None,
             low=self._safe_decimal(candle[3]) if len(candle) > 3 else None,
@@ -752,7 +773,8 @@ class HyperliquidRest(HyperliquidBase):
         return TradeData(
             id=str(trade_data.get('id', '')),
             symbol=symbol,
-            side=OrderSide.BUY if trade_data.get('side') == 'buy' else OrderSide.SELL,
+            side=OrderSide.BUY if trade_data.get(
+                'side') == 'buy' else OrderSide.SELL,
             amount=self._safe_decimal(trade_data.get('amount')),
             price=self._safe_decimal(trade_data.get('price')),
             cost=self._safe_decimal(trade_data.get('cost')),
@@ -777,7 +799,8 @@ class HyperliquidRest(HyperliquidBase):
     def _parse_position(self, position_info: Dict[str, Any]) -> PositionData:
         """解析持仓数据"""
         symbol = self.reverse_map_symbol(position_info.get('symbol', ''))
-        side = PositionSide.LONG if position_info.get('side') == 'long' else PositionSide.SHORT
+        side = PositionSide.LONG if position_info.get(
+            'side') == 'long' else PositionSide.SHORT
 
         return PositionData(
             symbol=symbol,
@@ -786,13 +809,16 @@ class HyperliquidRest(HyperliquidBase):
             entry_price=self._safe_decimal(position_info.get('entryPrice')),
             mark_price=self._safe_decimal(position_info.get('markPrice')),
             current_price=self._safe_decimal(position_info.get('markPrice')),
-            unrealized_pnl=self._safe_decimal(position_info.get('unrealizedPnl')),
+            unrealized_pnl=self._safe_decimal(
+                position_info.get('unrealizedPnl')),
             realized_pnl=self._safe_decimal(position_info.get('realizedPnl')),
             percentage=self._safe_decimal(position_info.get('percentage')),
             leverage=self._safe_int(position_info.get('leverage', 1)),
-            margin_mode=MarginMode.CROSS if position_info.get('marginType') == 'cross' else MarginMode.ISOLATED,
+            margin_mode=MarginMode.CROSS if position_info.get(
+                'marginType') == 'cross' else MarginMode.ISOLATED,
             margin=self._safe_decimal(position_info.get('initialMargin')),
-            liquidation_price=self._safe_decimal(position_info.get('liquidationPrice')),
+            liquidation_price=self._safe_decimal(
+                position_info.get('liquidationPrice')),
             timestamp=datetime.now(),
             raw_data=position_info
         )
@@ -809,7 +835,8 @@ class HyperliquidRest(HyperliquidBase):
             'expired': OrderStatus.EXPIRED
         }
 
-        status = status_mapping.get(order_data.get('status'), OrderStatus.UNKNOWN)
+        status = status_mapping.get(
+            order_data.get('status'), OrderStatus.UNKNOWN)
 
         # 映射订单类型
         type_mapping = {
@@ -827,7 +854,8 @@ class HyperliquidRest(HyperliquidBase):
             id=str(order_data.get('id', '')),
             client_id=order_data.get('clientOrderId'),
             symbol=symbol,
-            side=OrderSide.BUY if order_data.get('side') == 'buy' else OrderSide.SELL,
+            side=OrderSide.BUY if order_data.get(
+                'side') == 'buy' else OrderSide.SELL,
             type=order_type,
             amount=self._safe_decimal(order_data.get('amount')),
             price=self._safe_decimal(order_data.get('price')),
@@ -837,9 +865,10 @@ class HyperliquidRest(HyperliquidBase):
             average=self._safe_decimal(order_data.get('average')),
             status=status,
             timestamp=self._safe_parse_timestamp(order_data.get('timestamp')),
-            updated=self._safe_parse_timestamp(order_data.get('lastTradeTimestamp')) if order_data.get('lastTradeTimestamp') else None,
+            updated=self._safe_parse_timestamp(order_data.get(
+                'lastTradeTimestamp')) if order_data.get('lastTradeTimestamp') else None,
             fee=order_data.get('fee'),
             trades=order_data.get('trades', []),
             params={},
             raw_data=order_data
-        ) 
+        )
