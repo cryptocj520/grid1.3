@@ -15,7 +15,7 @@ from datetime import datetime
 from collections import defaultdict
 
 from ....logging import get_logger
-from ....adapters.exchanges import OrderSide as ExchangeOrderSide, PositionSide, OrderType
+from ....adapters.exchanges import OrderSide as ExchangeOrderSide, PositionSide, OrderType, MarginMode
 from ....adapters.exchanges.models import PositionData
 from ..models import GridConfig, GridOrder, GridOrderSide, GridOrderStatus, GridType
 
@@ -23,16 +23,18 @@ from ..models import GridConfig, GridOrder, GridOrderSide, GridOrderStatus, Grid
 class OrderHealthChecker:
     """订单健康检查器"""
 
-    def __init__(self, config: GridConfig, engine):
+    def __init__(self, config: GridConfig, engine, reserve_manager=None):
         """
         初始化健康检查器
 
         Args:
             config: 网格配置
             engine: 网格引擎实例（用于访问交易所和下单功能）
+            reserve_manager: 现货预留管理器（可选，仅现货）
         """
         self.config = config
         self.engine = engine
+        self.reserve_manager = reserve_manager  # 🔥 保存预留管理器引用
         self.logger = get_logger(__name__)
 
         # 🔥 配置健康检查日志：只输出到文件，不显示在终端UI
@@ -83,9 +85,16 @@ class OrderHealthChecker:
             # 获取订单（使用REST API）
             orders = await self.engine.exchange.get_open_orders(self.config.symbol)
 
-            # 🆕 获取持仓（使用REST API）
+            # 🔥 获取持仓（区分现货和合约）
             try:
-                positions = await self.engine.exchange.get_positions([self.config.symbol])
+                if self._is_spot_mode():
+                    # 🔥 现货模式：通过余额查询
+                    positions = await self._query_spot_position()
+                    self.logger.debug("📊 健康检查(现货): 使用余额查询持仓")
+                else:
+                    # 🔥 合约模式：通过持仓查询
+                    positions = await self.engine.exchange.get_positions([self.config.symbol])
+                    self.logger.debug("📊 健康检查(合约): 使用持仓查询")
 
                 if positions:
                     self.logger.debug(
@@ -277,34 +286,86 @@ class OrderHealthChecker:
             result['actual_position'] = Decimal('0')
             result['position_side'] = None
 
+        # 🔥 获取容差配置（所有情况都使用统一的容错）
+        position_tolerance_config = getattr(
+            self.config, 'position_tolerance', {})
+        tolerance_multiplier = position_tolerance_config.get(
+            'tolerance_multiplier', 1.0) if isinstance(position_tolerance_config, dict) else 1.0
+        tolerance = self.config.order_amount * \
+            Decimal(str(tolerance_multiplier))
+
         # 检查持仓方向
         if result['expected_side'] != result['position_side']:
-            result['is_healthy'] = False
-            result['needs_adjustment'] = True
-
             if result['expected_side'] is None:
                 # 预期无持仓，但实际有持仓
-                result['issues'].append('存在多余持仓需要平仓')
-                if result['position_side'] == PositionSide.LONG:
-                    result['adjustment_action'] = 'close_long'
-                    result['adjustment_amount'] = result['actual_position']
+                # 🔥 应用容错：只有当实际持仓 > 容错阈值时才判定为异常
+                actual_position_abs = abs(result['actual_position'])
+
+                self.logger.debug(
+                    f"🔍 持仓容错检查（预期无持仓）: 预期=0, "
+                    f"实际={result['actual_position']}, "
+                    f"差异={actual_position_abs}, 容错={tolerance}"
+                )
+
+                if actual_position_abs >= tolerance:
+                    # 实际持仓达到或超过容错范围，判定为异常
+                    result['is_healthy'] = False
+                    result['needs_adjustment'] = True
+                    result['issues'].append('存在多余持仓需要平仓')
+                    if result['position_side'] == PositionSide.LONG:
+                        result['adjustment_action'] = 'close_long'
+                        result['adjustment_amount'] = result['actual_position']
+                    else:
+                        result['adjustment_action'] = 'close_short'
+                        result['adjustment_amount'] = abs(
+                            result['actual_position'])
+
+                    self.logger.debug(
+                        f"❌ 持仓异常（超出容错范围）: 差异={actual_position_abs} >= 容错={tolerance}"
+                    )
                 else:
-                    result['adjustment_action'] = 'close_short'
-                    result['adjustment_amount'] = abs(
-                        result['actual_position'])
+                    # 差异严格小于容错，视为健康
+                    self.logger.debug(
+                        f"✅ 持仓检查通过（在容错范围内）: "
+                        f"差异={actual_position_abs} < 容错={tolerance}"
+                    )
 
             elif result['position_side'] is None:
                 # 预期有持仓，但实际无持仓
-                result['issues'].append('缺少持仓需要开仓')
-                if result['expected_side'] == PositionSide.LONG:
-                    result['adjustment_action'] = 'open_long'
-                    result['adjustment_amount'] = expected_position
+                # 🔥 应用容错：只有当预期持仓 > 容错阈值时才判定为异常
+                expected_position_abs = abs(expected_position)
+
+                self.logger.debug(
+                    f"🔍 持仓容错检查（预期有持仓）: 预期={expected_position}, "
+                    f"实际=0, 差异={expected_position_abs}, 容错={tolerance}"
+                )
+
+                if expected_position_abs >= tolerance:
+                    # 预期持仓达到或超过容错范围，判定为异常
+                    result['is_healthy'] = False
+                    result['needs_adjustment'] = True
+                    result['issues'].append('缺少持仓需要开仓')
+                    if result['expected_side'] == PositionSide.LONG:
+                        result['adjustment_action'] = 'open_long'
+                        result['adjustment_amount'] = expected_position
+                    else:
+                        result['adjustment_action'] = 'open_short'
+                        result['adjustment_amount'] = abs(expected_position)
+
+                    self.logger.debug(
+                        f"❌ 持仓异常（超出容错范围）: 差异={expected_position_abs} >= 容错={tolerance}"
+                    )
                 else:
-                    result['adjustment_action'] = 'open_short'
-                    result['adjustment_amount'] = abs(expected_position)
+                    # 差异严格小于容错，视为健康
+                    self.logger.debug(
+                        f"✅ 持仓检查通过（在容错范围内）: "
+                        f"差异={expected_position_abs} < 容错={tolerance}"
+                    )
 
             else:
                 # 持仓方向相反
+                result['is_healthy'] = False
+                result['needs_adjustment'] = True
                 result['issues'].append('持仓方向错误需要反向')
                 result['adjustment_action'] = 'reverse'
                 if result['expected_side'] == PositionSide.LONG:
@@ -316,16 +377,26 @@ class OrderHealthChecker:
 
         # 检查持仓数量（只有方向正确时才检查数量）
         elif result['expected_side'] is not None:
-            # 允许的误差范围（单格数量的0.01）
-            tolerance = self.config.order_amount * Decimal('0.01')
-            position_diff = abs(result['actual_position'] - expected_position)
+            # 🔥 现货模式：actual_position 已经在 _query_spot_position() 中减去了预留
+            # 所以这里不需要再减去预留，直接使用即可
+            actual_position_for_check = result['actual_position']
 
-            if position_diff > tolerance:
+            position_diff = abs(actual_position_for_check - expected_position)
+
+            self.logger.debug(
+                f"🔍 持仓容错检查（方向正确）: 预期={expected_position}, "
+                f"实际={actual_position_for_check}, "
+                f"差异={position_diff}, 容错={tolerance}"
+            )
+
+            if position_diff >= tolerance:
                 result['is_healthy'] = False
                 result['needs_adjustment'] = True
-                result['issues'].append(f'持仓数量不匹配（差异: {position_diff}）')
+                result['issues'].append(
+                    f'持仓数量不匹配（差异: {position_diff}, 容错: {tolerance}）'
+                )
 
-                if result['actual_position'] > expected_position:
+                if actual_position_for_check > expected_position:
                     # 持仓过多，需要平仓
                     result['adjustment_amount'] = position_diff
                     if result['expected_side'] == PositionSide.LONG:
@@ -339,6 +410,12 @@ class OrderHealthChecker:
                         result['adjustment_action'] = 'open_long'
                     else:
                         result['adjustment_action'] = 'open_short'
+            else:
+                # 🔥 差异严格小于容错，视为健康
+                self.logger.debug(
+                    f"✅ 持仓检查通过（在容错范围内）: "
+                    f"差异={position_diff} < 容错={tolerance}"
+                )
 
         return result
 
@@ -455,13 +532,15 @@ class OrderHealthChecker:
                 f"使用市价单平仓: {order_side.value} {amount} (参考价格: {current_price})")
 
             # 调用交易所接口平仓（市价单）
-            # 注意：Backpack API 不支持 reduceOnly 参数，直接使用市价单即可平仓
+            # 注意：
+            # - Backpack: 不支持 reduceOnly，price=None即可
+            # - Hyperliquid: 市价单需要price来计算滑点（默认5%）
             order = await self.engine.exchange.create_order(
                 symbol=self.config.symbol,
                 side=order_side,
                 order_type=OrderType.MARKET,  # 使用市价单
                 amount=amount,
-                price=None  # 市价单不需要价格
+                price=current_price  # Hyperliquid需要价格计算滑点，Backpack会忽略
                 # 不传递 params，避免 Backpack API 签名错误
             )
 
@@ -493,12 +572,15 @@ class OrderHealthChecker:
                 f"使用市价单开仓: {order_side.value} {amount} (参考价格: {current_price})")
 
             # 调用交易所接口开仓（市价单）
+            # 注意：
+            # - Backpack: price=None即可
+            # - Hyperliquid: 市价单需要price来计算滑点（默认5%）
             order = await self.engine.exchange.create_order(
                 symbol=self.config.symbol,
                 side=order_side,
                 order_type=OrderType.MARKET,  # 使用市价单
                 amount=amount,
-                price=None,  # 市价单不需要价格
+                price=current_price,  # Hyperliquid需要价格计算滑点，Backpack会忽略
                 params={}
             )
 
@@ -939,6 +1021,54 @@ class OrderHealthChecker:
                     f"💡 建议: 手动检查是否存在异常订单"
                 )
             else:
+                # 🔥 现货模式特殊处理：先补充持仓，再补充订单
+                # 原因：现货模式下，卖单需要有实际持仓才能挂出
+                if self._is_spot_mode() and position_health['needs_adjustment']:
+                    # 检查是否需要开仓（买入）
+                    action = position_health['adjustment_action']
+                    if action in ['open_long', 'open_short', 'reverse']:
+                        self.logger.debug(
+                            "=" * 80
+                        )
+                        self.logger.debug(
+                            "🔥 阶段10.5: 现货模式 - 补单前先调整持仓"
+                        )
+                        self.logger.debug(
+                            "=" * 80
+                        )
+                        self.logger.debug(
+                            f"💡 原因: 现货模式需要先有持仓才能挂卖单"
+                        )
+                        self.logger.debug(
+                            f"   持仓调整动作: {action}"
+                        )
+                        self.logger.debug(
+                            f"   调整数量: {position_health['adjustment_amount']}"
+                        )
+
+                        # 先调整持仓
+                        adjustment_success = await self._adjust_position(position_health)
+
+                        if adjustment_success:
+                            self.logger.debug("✅ 持仓调整完成，等待生效...")
+                            await asyncio.sleep(2)
+
+                            # 重新获取持仓验证
+                            _, updated_positions = await self._fetch_orders_and_positions()
+                            updated_position_health = self._check_position_health(
+                                expected_position, updated_positions
+                            )
+
+                            if updated_position_health['is_healthy']:
+                                self.logger.debug("✅ 持仓已调整到位，现在可以补充订单")
+                            else:
+                                self.logger.warning(
+                                    f"⚠️ 持仓调整后仍有问题: "
+                                    f"{', '.join(updated_position_health['issues'])}"
+                                )
+                        else:
+                            self.logger.error("❌ 持仓调整失败，补单可能会失败")
+
                 # 允许补单
                 await self._fill_missing_grids(missing_grids, theoretical_range)
 
@@ -1634,3 +1764,83 @@ class OrderHealthChecker:
 
         except Exception as e:
             self.logger.error(f"❌ 同步订单到引擎失败: {e}")
+
+    def _is_spot_mode(self) -> bool:
+        """判断是否是现货模式"""
+        try:
+            from ....adapters.exchanges.interface import ExchangeType
+            if hasattr(self.engine, 'exchange') and hasattr(self.engine.exchange, 'config'):
+                is_spot = self.engine.exchange.config.exchange_type == ExchangeType.SPOT
+                return is_spot
+        except Exception as e:
+            self.logger.error(f"❌ 判断现货模式失败: {e}")
+        return False
+
+    async def _query_spot_position(self) -> List[PositionData]:
+        """
+        查询现货持仓（通过余额）
+
+        Returns:
+            List[PositionData]: 持仓列表（0或1个元素）
+        """
+        try:
+            # 解析交易对，获取基础货币
+            symbol_parts = self.config.symbol.split('/')
+            base_currency = symbol_parts[0]  # UBTC
+
+            # 查询余额
+            balances = await self.engine.exchange.get_balances()
+
+            # 获取基础货币余额
+            total_balance = Decimal('0')
+            if balances:
+                for balance in balances:
+                    if balance.currency == base_currency:
+                        total_balance = balance.total  # 总余额
+                        break
+
+            # 🔥 减去预留（如果有）
+            trading_balance = total_balance
+            if self.reserve_manager:
+                reserve_amount = self.reserve_manager.reserve_amount  # 使用固定预留
+                trading_balance = total_balance - reserve_amount
+                self.logger.debug(
+                    f"📊 现货持仓检查: 总余额={total_balance}, 预留={reserve_amount}, "
+                    f"交易持仓={trading_balance}"
+                )
+
+            # 如果没有持仓，返回空列表
+            if trading_balance <= 0:
+                return []
+
+            # 🔥 构造 PositionData 对象
+            # 现货只有多头
+            position = PositionData(
+                symbol=self.config.symbol,
+                side=PositionSide.LONG,
+                size=trading_balance,
+                entry_price=Decimal('0'),  # 健康检查不需要准确的成本价
+                mark_price=None,  # 标记价格（现货不需要）
+                current_price=None,  # 当前价格（健康检查不需要）
+                unrealized_pnl=Decimal('0'),
+                realized_pnl=Decimal('0'),  # 已实现盈亏
+                percentage=None,  # 收益率百分比
+                leverage=1,
+                margin_mode=MarginMode.CROSS,  # 🔥 修复：使用CROSS而不是CROSSED
+                margin=Decimal('0'),
+                liquidation_price=None,
+                timestamp=datetime.now(),
+                raw_data={}  # 原始数据
+            )
+
+            self.logger.debug(
+                f"📊 现货持仓查询成功: {trading_balance} {base_currency}"
+            )
+
+            return [position]
+
+        except Exception as e:
+            self.logger.error(f"❌ 查询现货持仓失败: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return []

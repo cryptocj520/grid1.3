@@ -10,7 +10,6 @@
    - Binance: 期货交易所
    - OKX: 现货、永续合约、期货、期权交易所
    - EdgeX: 永续合约交易所
-   - Lighter: 永续合约交易所
 
    每个适配器都包含:
    - 完整的交易功能实现
@@ -24,13 +23,11 @@ from .backpack import BackpackAdapter
 from .binance import BinanceAdapter
 from .okx import OKXAdapter
 from .edgex import EdgeXAdapter
-from .lighter import LighterAdapter
 
 __all__ = [
     'HyperliquidAdapter',
     'BackpackAdapter',
     'BinanceAdapter',
     'OKXAdapter',
-    'EdgeXAdapter',
-    'LighterAdapter'
+    'EdgeXAdapter'
 ]

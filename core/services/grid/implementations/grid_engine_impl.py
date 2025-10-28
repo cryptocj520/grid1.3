@@ -118,8 +118,18 @@ class GridEngineImpl(IGridEngine):
 
         # 🆕 初始化健康检查器（使用新模块）
         from .order_health_checker import OrderHealthChecker
-        self._health_checker = OrderHealthChecker(config, self)
+
+        # 🔥 从 coordinator 获取 reserve_manager（如果存在）
+        reserve_manager = None
+        if self.coordinator and hasattr(self.coordinator, 'reserve_manager'):
+            reserve_manager = self.coordinator.reserve_manager
+
+        self._health_checker = OrderHealthChecker(
+            config, self, reserve_manager)
         self.logger.info("✅ 订单健康检查器已初始化（新模块）")
+
+        if reserve_manager:
+            self.logger.info("✅ 健康检查器已配置现货预留管理")
 
         # 🔥 启动订单健康检查
         self._start_order_health_check()
@@ -382,6 +392,11 @@ class GridEngineImpl(IGridEngine):
             取消的订单数量
         """
         try:
+            # 🔥 如果引擎未初始化，直接返回
+            if self.config is None:
+                self.logger.debug("引擎未初始化，跳过取消订单")
+                return 0
+
             # 🔥 关键修复：记录所有待取消的订单ID
             # 在调用取消前先记录，避免WebSocket事件先到达
             pending_order_ids = list(self._pending_orders.keys())
@@ -852,23 +867,185 @@ class GridEngineImpl(IGridEngine):
         }
         """
         try:
-            # 🔥 DEBUG: 方法入口
-            print(f"\n[ENGINE-DEBUG] _on_order_update 被调用！", flush=True)
-            print(f"[ENGINE-DEBUG] 更新数据: {update_data}", flush=True)
+            # 🔍 DEBUG: 方法入口 - 打印基本信息
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            print(
+                f"\n[ENGINE-ORDER-UPDATE] 🔔 [{timestamp}] _on_order_update 被调用！", flush=True)
+            print(
+                f"[ENGINE-ORDER-UPDATE] 数据类型: {type(update_data)}", flush=True)
+            print(
+                f"[ENGINE-ORDER-UPDATE] 数据长度: {len(update_data) if isinstance(update_data, (list, dict)) else 'N/A'}", flush=True)
+
+            # 🔍 打印完整的原始数据
+            if isinstance(update_data, list):
+                print(
+                    f"[ENGINE-ORDER-UPDATE] 这是一个列表，包含 {len(update_data)} 个元素", flush=True)
+                for idx, item in enumerate(update_data[:3]):  # 只打印前3个
+                    print(
+                        f"[ENGINE-ORDER-UPDATE] 元素[{idx}]类型={type(item)}, 内容={item if not isinstance(item, dict) else {k:v for k,v in list(item.items())[:5]}}", flush=True)
+            elif isinstance(update_data, dict):
+                print(
+                    f"[ENGINE-ORDER-UPDATE] 这是一个字典，键={list(update_data.keys())}", flush=True)
+                print(
+                    f"[ENGINE-ORDER-UPDATE] 字典内容（前5个键）: {dict(list(update_data.items())[:5])}", flush=True)
+            else:
+                print(f"[ENGINE-ORDER-UPDATE] 数据内容: {update_data}", flush=True)
 
             # 🔥 更新WebSocket消息时间戳（表示WebSocket正常工作）
             self._last_ws_message_time = time.time()
 
             # 添加调试日志
-            self.logger.debug(f"📨 收到WebSocket订单更新: {update_data}")
+            self.logger.info(
+                f"[WS-CALLBACK-DEBUG] 📨 收到WebSocket订单更新回调，数据类型={type(update_data)}")
+            self.logger.debug(f"📨 完整订单更新数据: {update_data}")
             self.logger.debug(
                 f"📊 WebSocket消息时间戳已更新: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self._last_ws_message_time))}")
 
-            # ✅ 关键修复：Backpack的数据在'data'字段中
-            data = update_data.get('data', {})
+            # 🔥 检测数据格式：Hyperliquid OrderData对象 vs Backpack字典
+            from ....adapters.exchanges.models import OrderData as ExchangeOrderData
+
+            # === Hyperliquid: OrderData对象 ===
+            if isinstance(update_data, ExchangeOrderData):
+                print(f"[ENGINE-DEBUG] 收到Hyperliquid OrderData对象", flush=True)
+                print(
+                    f"[ENGINE-DEBUG] OrderID: {update_data.order_id}, Status: {update_data.status}", flush=True)
+
+                order_id = str(update_data.order_id)
+                status = update_data.status.upper() if update_data.status else ""
+                event_type = "order_update"
+
+                # 检查是否是我们的订单
+                if order_id not in self._pending_orders:
+                    self.logger.debug(f"收到非监控订单的更新: {order_id}")
+                    return
+
+                grid_order = self._pending_orders[order_id]
+                print(
+                    f"[ENGINE-DEBUG] ✅ 找到订单！Grid={grid_order.grid_id}, Side={grid_order.side}", flush=True)
+
+                # Hyperliquid的订单状态
+                if status in ["FILLED", "CLOSED"]:
+                    print(f"[ENGINE-DEBUG] ✅ Hyperliquid订单已成交！", flush=True)
+
+                    filled_price = update_data.average_price or update_data.price or grid_order.price
+                    filled_amount = update_data.filled_amount or grid_order.amount
+
+                    print(
+                        f"[ENGINE-DEBUG] 成交价格={filled_price}, 成交数量={filled_amount}", flush=True)
+
+                    grid_order.mark_filled(filled_price, filled_amount)
+                    del self._pending_orders[order_id]
+
+                    self.logger.info(
+                        f"✅ WebSocket订单成交: {grid_order.side.value} {filled_amount}@{filled_price} "
+                        f"(Grid {grid_order.grid_id}, OrderID: {order_id})"
+                    )
+
+                    # 触发回调（重要！）
+                    print(
+                        f"[ENGINE-DEBUG] 触发 {len(self._order_callbacks)} 个回调", flush=True)
+                    for callback in self._order_callbacks:
+                        try:
+                            if asyncio.iscoroutinefunction(callback):
+                                await callback(grid_order)
+                            else:
+                                callback(grid_order)
+                        except Exception as e:
+                            self.logger.error(f"订单回调执行失败: {e}")
+
+                    print(f"[ENGINE-DEBUG] Hyperliquid订单成交处理完成\n", flush=True)
+                    return
+
+                elif status in ["CANCELLED", "CANCELED"]:
+                    print(
+                        f"[ENGINE-DEBUG] ✅ Hyperliquid订单被取消！order_id={order_id}", flush=True)
+
+                    if order_id in self._pending_orders:
+                        del self._pending_orders[order_id]
+
+                    is_expected_cancellation = order_id in self._expected_cancellations
+                    if is_expected_cancellation:
+                        self._expected_cancellations.remove(order_id)
+                        self.logger.info(
+                            f"ℹ️ Hyperliquid订单已主动取消: {grid_order.grid_id}")
+                    else:
+                        self.logger.warning(
+                            f"⚠️ Hyperliquid订单被手动取消: {grid_order.grid_id}")
+                        # TODO: 可能需要重新挂单
+
+                    return
+
+            # === Hyperliquid: 列表格式（订单列表更新）===
+            if isinstance(update_data, list):
+                print(
+                    f"\n[WS-ORDER] 收到Hyperliquid订单列表，包含{len(update_data)}个订单", flush=True)
+
+                # 🔥 遍历处理每个订单（实现实时WebSocket监控）
+                processed_count = 0
+                for order_item in update_data:
+                    if isinstance(order_item, dict):
+                        # 提取订单信息
+                        order_id = str(order_item.get('id', ''))
+                        status = order_item.get('status', '').lower()
+
+                        # 检查是否是我们的订单
+                        if order_id not in self._pending_orders:
+                            continue
+
+                        grid_order = self._pending_orders[order_id]
+
+                        # 处理订单成交
+                        if status in ['closed', 'filled']:
+                            print(
+                                f"[WS-ORDER] ✅ 订单成交！OrderID={order_id}, Grid {grid_order.grid_id}", flush=True)
+
+                            filled_price = Decimal(
+                                str(order_item.get('price', grid_order.price)))
+                            filled_amount = Decimal(
+                                str(order_item.get('filled', grid_order.amount)))
+
+                            # 标记成交并移除
+                            grid_order.mark_filled(filled_price, filled_amount)
+                            del self._pending_orders[order_id]
+
+                            self.logger.info(
+                                f"✅ WebSocket订单成交: {grid_order.side.value} {filled_amount}@{filled_price} "
+                                f"(Grid {grid_order.grid_id}, OrderID: {order_id})"
+                            )
+
+                            # 🔥 触发回调（反向挂单）
+                            for callback in self._order_callbacks:
+                                try:
+                                    if asyncio.iscoroutinefunction(callback):
+                                        await callback(grid_order)
+                                    else:
+                                        callback(grid_order)
+                                except Exception as e:
+                                    self.logger.error(f"订单回调执行失败: {e}")
+
+                            processed_count += 1
+
+                if processed_count > 0:
+                    print(
+                        f"[WS-ORDER] ✅ 处理了{processed_count}个订单成交，已触发反向挂单\n", flush=True)
+
+                return
+
+            # === Backpack: 字典格式 ===
+            if not isinstance(update_data, dict):
+                self.logger.warning(f"未知的订单更新格式: {type(update_data)}")
+                return
+
+            print(f"[ENGINE-DEBUG] 使用Backpack格式处理", flush=True)
+            data = update_data.get('data', update_data)
             print(f"[ENGINE-DEBUG] data字段内容: {data}", flush=True)
 
-            # ✅ 从data字段中提取订单信息
+            # 如果data仍然不是字典，跳过
+            if not isinstance(data, dict):
+                self.logger.debug(f"data字段不是字典格式，跳过: {type(data)}")
+                return
+
+            # 从data字段中提取订单信息（Backpack格式）
             order_id = data.get('i')  # Backpack使用'i'表示订单ID
             status = data.get('X')     # Backpack使用'X'表示状态
             event_type = data.get('e')  # 事件类型

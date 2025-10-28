@@ -50,7 +50,8 @@ class GridCoordinator:
         strategy: IGridStrategy,
         engine: IGridEngine,
         tracker: IPositionTracker,
-        grid_state: GridState
+        grid_state: GridState,
+        reserve_manager=None  # 🔥 可选的预留管理器（仅现货）
     ):
         """
         初始化协调器
@@ -61,12 +62,14 @@ class GridCoordinator:
             engine: 执行引擎
             tracker: 持仓跟踪器
             grid_state: 网格状态（共享实例）
+            reserve_manager: 现货预留管理器（可选）
         """
         self.logger = get_logger(__name__)
         self.config = config
         self.strategy = strategy
         self.engine = engine
         self.tracker = tracker
+        self.reserve_manager = reserve_manager  # 🔥 保存预留管理器引用
 
         # 🔥 设置 engine 的 coordinator 引用（用于 health_checker 访问剥头皮管理器等）
         if hasattr(engine, 'coordinator'):
@@ -74,6 +77,13 @@ class GridCoordinator:
 
         # 网格状态（使用传入的共享实例）
         self.state = grid_state
+
+        # 🔥 日志：预留管理状态
+        if self.reserve_manager:
+            self.logger.info("✅ 现货预留管理已启用（协调器已集成）")
+
+            # 🔥 将预留管理器传递给健康检查器（稍后在 engine 初始化完成后设置）
+            # 注意：_health_checker 在 engine.initialize() 中才创建，这里只是记录
 
         # 运行控制
         self._running = False
@@ -316,6 +326,17 @@ class GridCoordinator:
             # 此方法只记录交易历史和统计，不更新持仓
             self.tracker.record_filled_order(filled_order)
 
+            # 🔥 2.5. 记录现货买入手续费（仅现货且启用预留）
+            if self.reserve_manager and filled_order.side.value == 'buy':
+                fee = self.reserve_manager.record_buy_fee(
+                    filled_order.filled_amount or filled_order.amount
+                )
+                status = self.reserve_manager.get_status()
+                self.logger.info(
+                    f"📊 现货买入手续费: {fee} {self.reserve_manager.base_currency}, "
+                    f"预留健康度: {status['health_percent']:.1f}%"
+                )
+
             # 🔥 3. 检查剥头皮模式（使用新模块）
             if self.scalping_manager and self.scalping_ops:
                 # 检查是否是止盈订单成交
@@ -328,6 +349,17 @@ class GridCoordinator:
                     order_id=filled_order.order_id,
                     order_side=filled_order.side.value
                 )
+
+                # 🔥 剥头皮模式：等待持仓同步完成后再更新止盈订单
+                # 原因：REST API持仓同步有延迟，订单成交时tracker可能还没更新
+                # 解决方案：等待position_monitor的REST查询完成
+                await asyncio.sleep(1.0)  # 等待1秒让REST持仓同步完成
+
+                # 🔥 强制更新余额（确保当前权益计算准确）
+                # 原因：余额监控器默认10秒更新一次，订单成交后BTC/USDC数量变化需要立即反映
+                # 这样止盈价格计算才能使用最新的权益数据
+                self.logger.debug("💰 订单成交后强制更新余额...")
+                await self.balance_monitor.update_balance()
 
                 # 更新持仓信息到剥头皮管理器
                 current_position = self.tracker.get_current_position()
@@ -606,17 +638,23 @@ class GridCoordinator:
                     try:
                         from ....adapters.exchanges.models import OrderSide, OrderType
 
+                        # 🔥 修复：获取当前市场价格（Hyperliquid市价单需要价格计算滑点）
+                        ticker = await self.engine.exchange.get_ticker(self.config.symbol)
+                        current_price = ticker.last
+
                         # 确定平仓方向：平多仓=卖出，平空仓=买入
                         order_side = OrderSide.SELL if close_side == 'Sell' else OrderSide.BUY
 
                         # 调用交易所接口平仓（使用市价单）
-                        # 注意：使用 create_order 而不是 place_order，参数是 amount 不是 quantity
+                        # 注意：
+                        # - Backpack: 不支持 reduceOnly，price=None即可
+                        # - Hyperliquid: 市价单需要price来计算滑点（默认5%）
                         placed_order = await self.engine.exchange.create_order(
                             symbol=self.config.symbol,
                             side=order_side,
                             order_type=OrderType.MARKET,
                             amount=close_amount,
-                            price=None  # 市价单不需要价格
+                            price=current_price  # Hyperliquid需要价格计算滑点，Backpack会忽略
                         )
 
                         self.logger.info(f"✅ 平仓订单已提交: {placed_order.id}")
@@ -1369,6 +1407,34 @@ class GridCoordinator:
             self.logger.error(f"❌ 固定范围网格重置失败: {e}")
             raise
 
+    def _is_spot_mode(self) -> bool:
+        """判断是否是现货模式"""
+        try:
+            from ....adapters.exchanges.interface import ExchangeType
+            if hasattr(self.engine, 'exchange') and hasattr(self.engine.exchange, 'config'):
+                return self.engine.exchange.config.exchange_type == ExchangeType.SPOT
+        except Exception as e:
+            self.logger.debug(f"判断现货模式失败: {e}")
+        return False
+
+    def _get_reserve_amount(self) -> Decimal:
+        """
+        获取预留数量（仅现货模式）
+
+        Returns:
+            预留BTC数量，如果不是现货模式或没有预留管理器则返回0
+        """
+        if not self._is_spot_mode():
+            return Decimal('0')
+
+        try:
+            if self.reserve_manager:
+                return self.reserve_manager.reserve_amount
+        except Exception as e:
+            self.logger.debug(f"获取预留数量失败: {e}")
+
+        return Decimal('0')
+
     async def _place_take_profit_order(self):
         """挂止盈订单"""
         if not self.scalping_manager or not self.scalping_manager.is_active():
@@ -1378,8 +1444,10 @@ class GridCoordinator:
         current_price = await self.engine.get_current_price()
 
         # 计算止盈订单
+        # 🔥 现货模式：传入预留BTC数量，用于对称计算回本价格
+        reserve_amount = self._get_reserve_amount() if self._is_spot_mode() else None
         tp_order = self.scalping_manager.calculate_take_profit_order(
-            current_price)
+            current_price, reserve_amount=reserve_amount)
 
         if not tp_order:
             self.logger.warning("⚠️ 无法计算止盈订单（可能原因：初始本金未设置或无持仓）")

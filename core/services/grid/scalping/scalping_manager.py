@@ -182,15 +182,25 @@ class ScalpingManager:
                     f"已实现盈亏{realized_pnl:+.2f}"
                 )
 
-    def calculate_take_profit_order(self, current_price: Decimal) -> Optional[GridOrder]:
+    def calculate_take_profit_order(
+        self,
+        current_price: Decimal,
+        reserve_amount: Optional[Decimal] = None
+    ) -> Optional[GridOrder]:
         """
         计算止盈订单（基于初始本金和当前抵押品计算精确止盈价格）
 
         Args:
             current_price: 当前价格
+            reserve_amount: 现货模式预留数量（可选，仅现货模式使用）
 
         Returns:
             止盈订单，如果持仓为0则返回None
+
+        🔥 现货模式特殊处理：
+        - 下跌时：预留BTC和持仓BTC的价值下跌都计入总亏损
+        - 上涨时：预留BTC和持仓BTC的价值上涨都用于回本（对称计算）
+        - 止盈时：只卖出持仓BTC，预留BTC保持不动
         """
         if not self._is_scalping_active:
             return None
@@ -206,9 +216,25 @@ class ScalpingManager:
         realized_pnl = self._current_collateral - self._initial_capital
         position_abs = abs(self._current_position)
 
+        # 🔥 现货模式：计算回本价格时，需要将预留BTC也计入
+        # 原因：下跌时预留BTC的价值损失已经计入realized_pnl，
+        #      上涨时预留BTC的价值增长也应该用于回本（对称性）
+        is_spot_mode = reserve_amount is not None and reserve_amount > 0
+
         # 计算回本所需的价格变动
         if position_abs > 0:
-            required_price_move = -realized_pnl / position_abs
+            if is_spot_mode:
+                # 现货模式：使用 (持仓BTC + 预留BTC) 作为分母
+                total_btc = position_abs + abs(reserve_amount)
+                required_price_move = -realized_pnl / total_btc
+                self.logger.info(
+                    f"💰 现货模式止盈计算: "
+                    f"持仓BTC={position_abs:.8f}, 预留BTC={reserve_amount:.8f}, "
+                    f"总BTC={total_btc:.8f}, 已实现盈亏={realized_pnl:+.2f}"
+                )
+            else:
+                # 合约模式：只使用持仓作为分母（保持原有逻辑）
+                required_price_move = -realized_pnl / position_abs
         else:
             self.logger.warning("⚠️ 持仓为0，无法计算止盈价格")
             return None
@@ -223,12 +249,21 @@ class ScalpingManager:
             breakeven_grid = self.config.find_nearest_grid_index(
                 breakeven_price, direction="conservative")
 
-            # 止盈网格 = 回本网格 + 止盈网格数
-            take_profit_grids = self.config.scalping_take_profit_grids
-            self._take_profit_grid_index = min(
-                self.config.grid_count,
-                breakeven_grid + take_profit_grids
-            )
+            # 🔥 检查回本网格是否超出范围
+            if breakeven_grid > self.config.grid_count:
+                # 回本价格超出网格范围，使用最高网格作为止盈价格
+                self.logger.warning(
+                    f"⚠️ 回本价格 ${breakeven_price:,.2f} (Grid {breakeven_grid}) 超出网格范围 "
+                    f"(最高Grid {self.config.grid_count})，止盈价格将使用最高网格"
+                )
+                self._take_profit_grid_index = self.config.grid_count
+            else:
+                # 止盈网格 = 回本网格 + 止盈网格数（不超过网格范围）
+                take_profit_grids = self.config.scalping_take_profit_grids
+                self._take_profit_grid_index = min(
+                    self.config.grid_count,
+                    breakeven_grid + take_profit_grids
+                )
 
         # 🔥 做空网格：Grid 1 = 最高价
         else:
@@ -240,12 +275,21 @@ class ScalpingManager:
             breakeven_grid = self.config.find_nearest_grid_index(
                 breakeven_price, direction="conservative")
 
-            # 止盈网格 = 回本网格 - 止盈网格数
-            take_profit_grids = self.config.scalping_take_profit_grids
-            self._take_profit_grid_index = max(
-                1,
-                breakeven_grid - take_profit_grids
-            )
+            # 🔥 检查回本网格是否超出范围
+            if breakeven_grid < 1:
+                # 回本价格超出网格范围（低于最低网格），使用最低网格作为止盈价格
+                self.logger.warning(
+                    f"⚠️ 回本价格 ${breakeven_price:,.2f} (Grid {breakeven_grid}) 超出网格范围 "
+                    f"(最低Grid 1)，止盈价格将使用最低网格"
+                )
+                self._take_profit_grid_index = 1
+            else:
+                # 止盈网格 = 回本网格 - 止盈网格数（不低于第1格）
+                take_profit_grids = self.config.scalping_take_profit_grids
+                self._take_profit_grid_index = max(
+                    1,
+                    breakeven_grid - take_profit_grids
+                )
 
         # 从网格配置中获取精确的止盈价格
         take_profit_price = self.config.get_grid_price(

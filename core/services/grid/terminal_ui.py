@@ -296,7 +296,7 @@ class GridTerminalUI:
                 if tp_order:
                     content.append(f"├─ 🎯 止盈订单: ", style="white")
                     content.append(
-                        f"sell {abs(tp_order.amount):.4f}@${tp_order.price:,.2f} (Grid {tp_order.grid_id})",
+                        f"sell {abs(tp_order.amount):.5f}@${tp_order.price:,.2f} (Grid {tp_order.grid_id})",
                         style="bold yellow"
                     )
                     content.append("\n")
@@ -532,7 +532,7 @@ class GridTerminalUI:
         content = Text()
         content.append(f"├─ 当前持仓: ", style="white")
         content.append(
-            f"{stats.current_position:+.4f} {self.base_currency} ({position_type})      ", style=f"bold {position_color}")
+            f"{stats.current_position:+.5f} {self.base_currency} ({position_type})      ", style=f"bold {position_color}")
 
         # 🆕 计算持仓金额（仅作为显示，无实质功能）
         position_value = abs(stats.current_position) * stats.average_cost
@@ -615,12 +615,56 @@ class GridTerminalUI:
         content.append(
             f"订单冻结: ${stats.order_locked_balance:,.2f} USDC\n", style="white")
 
+        # 🔥 预留币种信息（仅现货且启用预留时显示）
+        if self.coordinator.reserve_manager:
+            reserve_status = self.coordinator.reserve_manager.get_status()
+
+            # 状态emoji和颜色
+            status_emoji = reserve_status['emoji']  # 🟢/🟡/🔴
+            health_percent = reserve_status['health_percent']
+
+            if health_percent >= 50:
+                health_color = "bold green"
+            elif health_percent >= 30:
+                health_color = "bold yellow"
+            else:
+                health_color = "bold red"
+
+            # 预留信息（动态获取币种名称）
+            reserve_amount = reserve_status['reserve_amount']
+            current_reserve = reserve_status['current_reserve']
+            total_consumed = reserve_status['total_consumed']
+            base_currency = self.coordinator.reserve_manager.base_currency
+
+            # 🔥 动态显示币种名称（不硬编码BTC）
+            content.append(f"├─ 预留{base_currency}: ", style="white")
+            content.append(
+                f"{status_emoji} {current_reserve:.8f}/{reserve_amount:.8f} {base_currency}  ",
+                style=health_color
+            )
+            content.append(f"健康度: {health_percent:.1f}%\n", style=health_color)
+
+            content.append(f"│  └─ 已消耗: ", style="white")
+            content.append(
+                f"{total_consumed:.8f} {base_currency}  ",
+                style="cyan"
+            )
+            content.append(
+                f"交易次数: {reserve_status['trades_count']}  ",
+                style="white"
+            )
+            content.append(
+                f"补充次数: {reserve_status['replenish_count']}\n",
+                style="white"
+            )
+
         # 🔥 未实现盈亏已删除（重复显示，盈亏统计面板中已有）
 
         # 🆕 爆仓风险提示（仅作为风险提示，无实质功能）
         liquidation_price, distance_percent, risk_level = self._calculate_liquidation_price(
             stats)
 
+        # 🔥 爆仓风险始终是最后一行
         content.append(f"└─ 爆仓风险: ", style="white")
 
         if risk_level == 'N/A':
@@ -726,7 +770,7 @@ class GridTerminalUI:
             side = trade['side']
             side_style = "green" if side == "buy" else "red"
             price = f"${trade['price']:,.2f}"
-            amount = f"{trade['amount']:.4f} {self.base_currency}"
+            amount = f"{trade['amount']:.5f} {self.base_currency}"
             grid_text = f"Grid {trade['grid_id']}"
 
             table.add_row(

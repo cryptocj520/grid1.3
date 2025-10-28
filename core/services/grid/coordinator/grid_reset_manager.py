@@ -348,6 +348,11 @@ class GridResetManager:
         )
         self.logger.info(f"✅ 网格层级已重新初始化，共{self.config.grid_count}个")
 
+        # 🔥 重置后进入初始化阶段（避免持仓变化误报）
+        if hasattr(self.coordinator, 'position_monitor') and self.coordinator.position_monitor:
+            self.coordinator.position_monitor.restart_initial_phase(
+                duration=60)
+
         # ======== 步骤7: 生成并挂出新订单 ========
         self.logger.info("📋 步骤 7/7: 生成并挂出新订单...")
         initial_orders = self.strategy.initialize(self.config)

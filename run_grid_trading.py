@@ -15,6 +15,11 @@ from core.services.grid.implementations import (
     PositionTrackerImpl
 )
 from core.services.grid.models import GridConfig, GridType, GridState
+from core.services.grid.reserve import (
+    SpotReserveManager,
+    ReserveMonitor,
+    check_spot_reserve_on_startup
+)
 from core.logging import get_system_logger
 import sys
 import asyncio
@@ -133,7 +138,59 @@ def create_grid_config(config_data: dict) -> GridConfig:
         params['reverse_order_grid_distance'] = int(
             grid_config['reverse_order_grid_distance'])
 
+    # 🔥 现货预留管理配置（仅现货需要）
+    if 'spot_reserve' in grid_config:
+        params['spot_reserve'] = grid_config['spot_reserve']
+
+    # 🔥 健康检查容错配置
+    if 'position_tolerance' in grid_config:
+        params['position_tolerance'] = grid_config['position_tolerance']
+
     return GridConfig(**params)
+
+
+def detect_market_type(symbol: str, exchange_name: str) -> ExchangeType:
+    """
+    根据交易对符号自动检测市场类型
+
+    Args:
+        symbol: 交易对符号
+        exchange_name: 交易所名称
+
+    Returns:
+        ExchangeType: 市场类型（现货或永续合约）
+    """
+    symbol_upper = symbol.upper()
+    exchange_lower = exchange_name.lower()
+
+    # Hyperliquid 交易所
+    if exchange_lower == "hyperliquid":
+        # Hyperliquid符号格式：
+        # - 现货: BTC/USDC (没有后缀)
+        # - 永续: BTC/USDC:USDC (后缀:USDC)
+        if ":USDC" in symbol_upper or ":PERP" in symbol_upper or ":SPOT" in symbol_upper:
+            # 有后缀的情况
+            if ":SPOT" in symbol_upper:
+                return ExchangeType.SPOT
+            else:
+                return ExchangeType.PERPETUAL
+        else:
+            # 🔥 没有后缀 → 现货（Hyperliquid的现货格式）
+            return ExchangeType.SPOT
+
+    # Backpack 交易所
+    elif exchange_lower == "backpack":
+        if "_PERP" in symbol_upper or "PERP" in symbol_upper:
+            return ExchangeType.PERPETUAL
+        elif "_SPOT" in symbol_upper or "SPOT" in symbol_upper:
+            return ExchangeType.SPOT
+        else:
+            # 默认为永续合约
+            return ExchangeType.PERPETUAL
+
+    # 其他交易所默认为永续合约
+    else:
+        return ExchangeType.PERPETUAL
 
 
 async def create_exchange_adapter(config_data: dict):
@@ -150,10 +207,18 @@ async def create_exchange_adapter(config_data: dict):
 
     grid_config = config_data['grid_system']
     exchange_name = grid_config['exchange'].lower()
+    symbol = grid_config['symbol']
+
+    # 🔥 自动检测市场类型（现货 vs 永续合约）
+    market_type = detect_market_type(symbol, exchange_name)
+
+    print(f"   - 市场类型: {market_type.value}")
 
     # 优先级：环境变量 > 交易所配置文件 > 空字符串
     api_key = os.getenv(f"{exchange_name.upper()}_API_KEY")
     api_secret = os.getenv(f"{exchange_name.upper()}_API_SECRET")
+    wallet_address = os.getenv(
+        f"{exchange_name.upper()}_WALLET_ADDRESS")  # 用于 Hyperliquid
 
     # 如果环境变量没有设置，尝试从交易所配置文件读取
     if not api_key or not api_secret:
@@ -166,12 +231,28 @@ async def create_exchange_adapter(config_data: dict):
 
                 auth_config = exchange_config_data.get(
                     exchange_name, {}).get('authentication', {})
-                api_key = api_key or auth_config.get('api_key', "")
-                api_secret = api_secret or auth_config.get(
-                    'private_key', "") or auth_config.get('api_secret', "")
+
+                # 🔥 修复：Hyperliquid 使用 private_key 和 wallet_address
+                if exchange_name == "hyperliquid":
+                    # Hyperliquid 使用 private_key 作为主密钥
+                    api_key = api_key or auth_config.get('private_key', "")
+                    api_secret = api_secret or auth_config.get(
+                        'private_key', "")  # 同一个密钥
+                    wallet_address = wallet_address or auth_config.get(
+                        'wallet_address', "")
+                else:
+                    # 其他交易所使用标准的 api_key/api_secret
+                    api_key = api_key or auth_config.get('api_key', "")
+                    api_secret = api_secret or auth_config.get(
+                        'private_key', "") or auth_config.get('api_secret', "")
+                    wallet_address = wallet_address or auth_config.get(
+                        'wallet_address', "")
 
                 if api_key and api_secret:
                     print(f"   ✓ 从配置文件读取API密钥: {exchange_config_path}")
+                    if exchange_name == "hyperliquid" and wallet_address:
+                        print(
+                            f"   ✓ 钱包地址: {wallet_address[:10]}...{wallet_address[-6:]}")
         except Exception as e:
             print(f"   ⚠️  无法读取交易所配置文件: {e}")
 
@@ -181,13 +262,20 @@ async def create_exchange_adapter(config_data: dict):
         print(
             f"   提示：请设置环境变量或在 config/exchanges/{exchange_name}_config.yaml 中配置")
 
+        # 🔥 Hyperliquid 特别提示
+        if exchange_name == "hyperliquid":
+            print(f"   💡 Hyperliquid 需要配置:")
+            print(f"      - private_key: 钱包私钥")
+            print(f"      - wallet_address: 钱包地址")
+
     # 创建交易所配置
     exchange_config = ExchangeConfig(
         exchange_id=exchange_name,
         name=exchange_name.capitalize(),
-        exchange_type=ExchangeType.PERPETUAL,  # 默认使用永续合约
+        exchange_type=market_type,  # 🔥 使用自动检测的市场类型
         api_key=api_key or "",
         api_secret=api_secret or "",
+        wallet_address=wallet_address,  # Hyperliquid 需要
         testnet=False,
         enable_websocket=True,
         enable_auto_reconnect=True
@@ -228,6 +316,28 @@ async def main(config_path: str = "config/grid/default_grid.yaml"):
         print(f"   - 交易所: {grid_config.exchange}")
         print(f"   - 交易对: {grid_config.symbol}")
         print(f"   - 网格类型: {grid_config.grid_type.value}")
+
+        # 🔥 现货做空校验：现货市场只能做多，不能做空
+        symbol = grid_config.symbol
+        exchange_name = grid_config.exchange.lower()
+        is_spot = False
+
+        # 检测是否为现货交易对
+        if exchange_name == "hyperliquid":
+            is_spot = ":SPOT" in symbol.upper()
+        elif exchange_name == "backpack":
+            is_spot = "_SPOT" in symbol.upper() or "SPOT" in symbol.upper()
+
+        # 如果是现货且选择了做空网格，拒绝启动
+        if is_spot and grid_config.grid_type.value in ["short", "martingale_short", "follow_short"]:
+            print(f"\n❌ 错误：现货市场不支持做空网格！")
+            print(f"   - 当前交易对: {symbol} (现货)")
+            print(f"   - 当前网格类型: {grid_config.grid_type.value} (做空)")
+            print(f"   - 建议：请使用做多网格类型 (long, martingale_long, follow_long)")
+            sys.exit(1)
+
+        if is_spot:
+            print(f"   ℹ️  现货市场：仅支持做多网格")
 
         # 🔥 价格移动网格：价格区间在运行时动态设置
         if grid_config.is_follow_mode():
@@ -270,6 +380,32 @@ async def main(config_path: str = "config/grid/default_grid.yaml"):
         tracker = PositionTrackerImpl(grid_config, grid_state)
         print("   ✓ 持仓跟踪器已创建")
 
+        # 🔥 创建预留管理器（仅现货）
+        reserve_manager = None
+        reserve_monitor = None
+
+        if exchange_adapter.config.exchange_type == ExchangeType.SPOT:
+            spot_reserve_config = getattr(grid_config, 'spot_reserve', None)
+
+            if spot_reserve_config and spot_reserve_config.get('enabled', False):
+                print("   ✓ 现货预留管理已启用")
+
+                reserve_manager = SpotReserveManager(
+                    reserve_config=spot_reserve_config,
+                    exchange_adapter=exchange_adapter,
+                    symbol=grid_config.symbol,
+                    quantity_precision=grid_config.quantity_precision
+                )
+
+                # 创建监控器（稍后启动）
+                reserve_monitor = ReserveMonitor(
+                    reserve_manager=reserve_manager,
+                    exchange_adapter=exchange_adapter,
+                    symbol=grid_config.symbol,
+                    check_interval=60
+                )
+                print("   ✓ 预留监控器已创建")
+
         # 4. 创建协调器
         print("\n🎮 步骤 4/6: 创建系统协调器...")
         coordinator = GridCoordinator(
@@ -277,9 +413,19 @@ async def main(config_path: str = "config/grid/default_grid.yaml"):
             strategy=strategy,
             engine=engine,
             tracker=tracker,
-            grid_state=grid_state
+            grid_state=grid_state,
+            reserve_manager=reserve_manager  # 🔥 传入预留管理器
         )
         print("✅ 协调器创建成功")
+
+        # 🔥 启动前检查（仅现货且启用预留管理）
+        if reserve_manager:
+            print("\n🔍 启动前检查: 验证现货预留BTC...")
+            if not await check_spot_reserve_on_startup(grid_config, exchange_adapter, reserve_manager):
+                print("❌ 启动检查失败，系统退出")
+                await exchange_adapter.disconnect()
+                sys.exit(1)
+            print("✅ 预留检查通过")
 
         # 5. 初始化并启动网格系统
         print("\n🚀 步骤 5/6: 启动网格系统...")
@@ -295,6 +441,11 @@ async def main(config_path: str = "config/grid/default_grid.yaml"):
         await coordinator.start()
         print("✅ 网格系统已启动")
         print(f"   - 已成功挂出{grid_config.grid_count}个订单")
+
+        # 🔥 启动预留监控（在网格启动后）
+        if reserve_monitor:
+            await reserve_monitor.start()
+            print("✅ 预留监控器已启动")
 
         # 🔥 价格移动网格：显示实际设置的价格区间
         if grid_config.is_follow_mode():
@@ -326,6 +477,11 @@ async def main(config_path: str = "config/grid/default_grid.yaml"):
         # 清理资源
         print("\n🧹 清理资源...")
         try:
+            # 🔥 停止预留监控器
+            if 'reserve_monitor' in locals() and reserve_monitor:
+                await reserve_monitor.stop()
+                print("   ✓ 预留监控器已停止")
+
             if 'coordinator' in locals():
                 await coordinator.stop()
                 print("   ✓ 网格系统已停止")
@@ -347,26 +503,49 @@ def print_usage():
     python3 run_grid_trading.py [配置文件路径]
 
 示例:
-    # 使用默认配置
-    python3 run_grid_trading.py
+    # 🔸 Backpack 交易所
+    python3 run_grid_trading.py config/grid/backpack_capital_protection_long_btc.yaml
     
-    # 使用做多网格配置
-    python3 run_grid_trading.py config/grid/backpack_btc_long.yaml
+    # 🔹 Hyperliquid 交易所 - 永续合约
+    python3 run_grid_trading.py config/grid/hyperliquid_btc_perp_long.yaml   # 做多
+    python3 run_grid_trading.py config/grid/hyperliquid_btc_perp_short.yaml  # 做空
     
-    # 使用做空网格配置
-    python3 run_grid_trading.py config/grid/backpack_btc_short.yaml
+    # 🔹 Hyperliquid 交易所 - 现货（仅支持做多）
+    python3 run_grid_trading.py config/grid/hyperliquid_btc_spot_long.yaml   # 做多
 
-配置文件:
-    - config/grid/default_grid.yaml          默认配置
-    - config/grid/backpack_btc_long.yaml     BTC做多网格
-    - config/grid/backpack_btc_short.yaml    BTC做空网格
+配置文件说明:
+    📂 Backpack 交易所配置:
+    - config/grid/backpack_capital_protection_long_*.yaml  # 做多网格（多币种）
+    - config/grid/backpack_capital_protection_short.yaml   # 做空网格
+    
+    📂 Hyperliquid 交易所配置:
+    - config/grid/hyperliquid_btc_perp_long.yaml   # BTC永续做多
+    - config/grid/hyperliquid_btc_perp_short.yaml  # BTC永续做空
+    - config/grid/hyperliquid_btc_spot_long.yaml   # BTC现货做多
+
+支持的交易所:
+    ✅ Backpack   - 永续合约（做多/做空）
+    ✅ Hyperliquid - 永续合约（做多/做空）、现货（仅做多）
 
 注意事项:
     1. 确保API密钥已正确配置
     2. 确保有足够的资金用于网格交易
     3. 建议先用小额资金测试
-    4. 网格系统会永久运行，除非手动停止
-    5. 使用 Ctrl+C 或 Q 键安全退出系统
+    4. ⚠️  现货市场只支持做多，不支持做空
+    5. 网格系统会永久运行，除非手动停止
+    6. 使用 Ctrl+C 或 Q 键安全退出系统
+
+API密钥配置:
+    方式1: 环境变量
+        export BACKPACK_API_KEY="your_api_key"
+        export BACKPACK_API_SECRET="your_api_secret"
+        
+        export HYPERLIQUID_API_KEY="your_private_key"
+        export HYPERLIQUID_API_SECRET="your_private_key"
+        export HYPERLIQUID_WALLET_ADDRESS="your_wallet_address"
+    
+    方式2: 配置文件
+        编辑 config/exchanges/{exchange_name}_config.yaml
     """)
 
 

@@ -110,6 +110,18 @@ class GridConfig:
     # - 例如：买单成交@$2.00，grid_interval=$0.01，distance=2
     #         → 反手卖单@$2.02（而非$2.01）
 
+    # 🔥 现货预留管理配置（可选，仅现货需要）
+    spot_reserve: Optional[dict] = None              # 现货预留管理配置
+    # 说明：用于管理现货交易中的币种预留（例如预留BTC用于手续费）
+    # - 仅对现货市场生效
+    # - 包含 enabled, reserve_amount, spot_buy_fee_rate 等配置
+
+    # 🔥 健康检查容错配置（可选）
+    position_tolerance: Optional[dict] = None        # 健康检查容错配置
+    # 说明：用于设置持仓健康检查的误差容忍度
+    # - 包含 tolerance_multiplier 等配置
+    # - 避免因手续费等微小差异导致的错误告警
+
     def __post_init__(self):
         """初始化后计算网格数量"""
         # 初始化 logger

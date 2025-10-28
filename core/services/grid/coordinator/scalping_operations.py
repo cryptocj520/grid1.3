@@ -65,6 +65,34 @@ class ScalpingOperations:
         self._same_directional_order_count = 0     # 同一方向性订单下的调整次数
         self._max_same_directional_updates = 1    # 同一方向性订单只操作1次
 
+    def _is_spot_mode(self) -> bool:
+        """判断是否是现货模式"""
+        try:
+            from ....adapters.exchanges.interface import ExchangeType
+            if hasattr(self.engine, 'exchange') and hasattr(self.engine.exchange, 'config'):
+                return self.engine.exchange.config.exchange_type == ExchangeType.SPOT
+        except Exception as e:
+            self.logger.debug(f"判断现货模式失败: {e}")
+        return False
+
+    def _get_reserve_amount(self) -> Decimal:
+        """
+        获取预留数量（仅现货模式）
+
+        Returns:
+            预留BTC数量，如果不是现货模式或没有预留管理器则返回0
+        """
+        if not self._is_spot_mode():
+            return Decimal('0')
+
+        try:
+            if hasattr(self.coordinator, 'reserve_manager') and self.coordinator.reserve_manager:
+                return self.coordinator.reserve_manager.reserve_amount
+        except Exception as e:
+            self.logger.debug(f"获取预留数量失败: {e}")
+
+        return Decimal('0')
+
     def update_last_directional_order(self, order_id: str, order_side: str):
         """
         更新最后一次方向性订单ID（由coordinator在订单成交时调用）
@@ -93,6 +121,14 @@ class ScalpingOperations:
     async def activate(self):
         """激活剥头皮模式（完整流程）"""
         self.logger.warning("🔴 正在激活剥头皮模式...")
+
+        # 🔥 0.0 如果当前不是剥头皮模式，说明是新的触发，清空频率限制计数器（双重保险）
+        if not self.scalping_manager.is_active():
+            self._last_directional_order_id = ""
+            self._same_directional_order_count = 0
+            if hasattr(self, '_last_checked_directional_order_id'):
+                self._last_checked_directional_order_id = ""
+            self.logger.debug("🔄 新的剥头皮触发，已清空操作频率限制计数器（激活时）")
 
         # 🛡️ 0. 检查全局状态（REST失败或持仓异常时拒绝激活）
         if hasattr(self.coordinator, 'is_emergency_stopped') and self.coordinator.is_emergency_stopped:
@@ -139,6 +175,12 @@ class ScalpingOperations:
             f"{current_position} {self.config.symbol.split('_')[0]}, "
             f"平均成本: ${average_cost:,.2f}"
         )
+
+        # 🔥 强制更新余额（确保当前权益计算准确）
+        # 原因：激活剥头皮时可能刚有订单成交，余额监控器的缓存数据可能过时
+        # 必须在计算止盈价格之前获取最新的USDC和BTC余额
+        self.logger.info("💰 激活剥头皮前强制更新余额...")
+        await self.coordinator.balance_monitor.update_balance()
 
         initial_capital = self.scalping_manager.get_initial_capital()
         self.scalping_manager.update_position(
@@ -298,6 +340,13 @@ class ScalpingOperations:
                     self.logger.error(f"⚠️ 获取最新余额失败: {e}")
 
                 self.logger.info("✅ 剥头皮重置完成，价格移动网格已重启")
+
+                # 🔥 清空频率限制计数器，允许下次剥头皮触发时重新挂止盈订单
+                self._last_directional_order_id = ""
+                self._same_directional_order_count = 0
+                if hasattr(self, '_last_checked_directional_order_id'):
+                    self._last_checked_directional_order_id = ""
+                self.logger.debug("🔄 已清空剥头皮操作频率限制计数器（重置后）")
             else:
                 # 普通/马丁网格：停止系统
                 self.logger.info("⏸️  普通/马丁网格模式：停止系统")
@@ -413,8 +462,10 @@ class ScalpingOperations:
                 continue
 
             # 4. 计算止盈订单
+            # 🔥 现货模式：传入预留BTC数量，用于对称计算回本价格
+            reserve_amount = self._get_reserve_amount() if self._is_spot_mode() else None
             tp_order = self.scalping_manager.calculate_take_profit_order(
-                current_price)
+                current_price, reserve_amount=reserve_amount)
 
             if not tp_order:
                 self.logger.warning("⚠️ 无法计算止盈订单")
@@ -459,15 +510,25 @@ class ScalpingOperations:
 
                 # 1. 验证持仓是否还与挂单时一致
                 final_position = self.tracker.get_current_position()
-                if abs(final_position) != placed_order.amount:
+                # 🔥 使用基础网格数量作为容差（允许精度截断和手续费误差）
+                tolerance = self.config.order_amount
+                position_diff = abs(abs(final_position) - placed_order.amount)
+
+                if position_diff > tolerance:
                     self.logger.error(
                         f"🚨 最终验证失败: 持仓已变化！\n"
                         f"   挂单时持仓: {placed_order.amount}\n"
                         f"   当前持仓: {abs(final_position)}\n"
+                        f"   差异: {position_diff} (超过容差{tolerance})\n"
                         f"   ⚠️ 止盈订单可能不匹配，请人工检查！\n"
                         f"   系统不会执行额外操作，等待下次方向性订单成交"
                     )
                     return True  # 返回True表示挂单成功，但有警告
+                elif position_diff > 0:
+                    self.logger.debug(
+                        f"✅ 持仓差异在容差范围内: "
+                        f"差异{position_diff} <= 容差{tolerance}（手续费/精度误差）"
+                    )
 
                 # 2. 验证止盈订单是否还存在且数量正确
                 try:
@@ -481,17 +542,30 @@ class ScalpingOperations:
                         # placed_order 是 GridOrder，使用 order_id；order 是 OrderData，使用 id
                         if order.id == placed_order.order_id:
                             tp_order_found = True
-                            if order.amount == abs(final_position):
+                            # 🔥 使用基础网格数量作为容差（允许精度截断和手续费误差）
+                            order_diff = abs(
+                                order.amount - abs(final_position))
+
+                            if order_diff <= tolerance:
                                 tp_order_correct = True
-                                self.logger.info(
-                                    f"✅ 最终验证通过: 止盈订单存在且数量正确 "
-                                    f"({order.amount} = {abs(final_position)})"
-                                )
+                                if order_diff == 0:
+                                    self.logger.info(
+                                        f"✅ 最终验证通过: 止盈订单存在且数量完全一致 "
+                                        f"({order.amount} = {abs(final_position)})"
+                                    )
+                                else:
+                                    self.logger.info(
+                                        f"✅ 最终验证通过: 止盈订单存在且数量在容差范围内\n"
+                                        f"   止盈订单: {order.amount}\n"
+                                        f"   当前持仓: {abs(final_position)}\n"
+                                        f"   差异: {order_diff} <= 容差{tolerance}（手续费/精度误差）"
+                                    )
                             else:
                                 self.logger.error(
                                     f"🚨 最终验证失败: 止盈订单数量不匹配！\n"
                                     f"   止盈订单数量: {order.amount}\n"
                                     f"   当前持仓: {abs(final_position)}\n"
+                                    f"   差异: {order_diff} (超过容差{tolerance})\n"
                                     f"   ⚠️ 可能存在问题，请人工检查！\n"
                                     f"   系统不会执行额外操作，等待下次方向性订单成交"
                                 )
@@ -528,6 +602,7 @@ class ScalpingOperations:
     async def update_take_profit_order_if_needed(self):
         """如果持仓变化，更新止盈订单（带验证）"""
         if not self.scalping_manager or not self.scalping_manager.is_active():
+            self.logger.debug("⏭️ 跳过更新止盈订单: 剥头皮未激活")
             return
 
         # 🛡️ 0. 检查全局状态（REST失败或持仓异常时跳过更新）
@@ -540,9 +615,17 @@ class ScalpingOperations:
             return
 
         current_position = self.tracker.get_current_position()
+        tp_order = self.scalping_manager.get_current_take_profit_order()
+
+        self.logger.debug(
+            f"🔍 检查止盈订单是否需要更新: "
+            f"当前持仓={current_position}, "
+            f"止盈订单数量={tp_order.amount if tp_order else None}"
+        )
 
         # 检查止盈订单是否需要更新
         if not self.scalping_manager.is_take_profit_order_outdated(current_position):
+            self.logger.debug("✅ 止盈订单无需更新")
             return
 
         self.logger.info("📋 持仓变化，需要更新止盈订单...")
