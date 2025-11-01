@@ -26,6 +26,8 @@ import asyncio
 import yaml
 from pathlib import Path
 from decimal import Decimal
+import argparse
+import logging
 
 # 添加项目根目录到路径
 project_root = Path(__file__).parent
@@ -188,6 +190,12 @@ def detect_market_type(symbol: str, exchange_name: str) -> ExchangeType:
             # 默认为永续合约
             return ExchangeType.PERPETUAL
 
+    # Lighter 交易所
+    elif exchange_lower == "lighter":
+        # Lighter是永续合约交易所，所有交易对都是永续合约
+        # 符号格式：BTC-USD, ETH-USD, SOL-USD等
+        return ExchangeType.PERPETUAL
+
     # 其他交易所默认为永续合约
     else:
         return ExchangeType.PERPETUAL
@@ -232,7 +240,7 @@ async def create_exchange_adapter(config_data: dict):
                 auth_config = exchange_config_data.get(
                     exchange_name, {}).get('authentication', {})
 
-                # 🔥 修复：Hyperliquid 使用 private_key 和 wallet_address
+                # 🔥 修复：不同交易所使用不同的认证方式
                 if exchange_name == "hyperliquid":
                     # Hyperliquid 使用 private_key 作为主密钥
                     api_key = api_key or auth_config.get('private_key', "")
@@ -240,6 +248,15 @@ async def create_exchange_adapter(config_data: dict):
                         'private_key', "")  # 同一个密钥
                     wallet_address = wallet_address or auth_config.get(
                         'wallet_address', "")
+                elif exchange_name == "lighter":
+                    # Lighter 使用 API Key私钥和账户索引
+                    api_config = exchange_config_data.get('api_config', {})
+                    auth_config = api_config.get('auth', {})
+                    api_key = api_key or auth_config.get(
+                        'api_key_private_key', "")
+                    api_secret = api_secret or auth_config.get(
+                        'api_key_private_key', "")
+                    # Lighter特殊配置将在创建适配器时单独处理
                 else:
                     # 其他交易所使用标准的 api_key/api_secret
                     api_key = api_key or auth_config.get('api_key', "")
@@ -262,24 +279,76 @@ async def create_exchange_adapter(config_data: dict):
         print(
             f"   提示：请设置环境变量或在 config/exchanges/{exchange_name}_config.yaml 中配置")
 
-        # 🔥 Hyperliquid 特别提示
+        # 🔥 交易所特殊配置提示
         if exchange_name == "hyperliquid":
             print(f"   💡 Hyperliquid 需要配置:")
             print(f"      - private_key: 钱包私钥")
             print(f"      - wallet_address: 钱包地址")
+        elif exchange_name == "lighter":
+            print(f"   💡 Lighter 需要配置:")
+            print(f"      - api_key_private_key: API Key私钥")
+            print(f"      - account_index: 账户索引")
+            print(f"      - api_key_index: API Key索引（默认0）")
 
     # 创建交易所配置
-    exchange_config = ExchangeConfig(
-        exchange_id=exchange_name,
-        name=exchange_name.capitalize(),
-        exchange_type=market_type,  # 🔥 使用自动检测的市场类型
-        api_key=api_key or "",
-        api_secret=api_secret or "",
-        wallet_address=wallet_address,  # Hyperliquid 需要
-        testnet=False,
-        enable_websocket=True,
-        enable_auto_reconnect=True
-    )
+    if exchange_name == "lighter":
+        # Lighter需要特殊的配置方式
+        try:
+            lighter_config_path = Path("config/exchanges/lighter_config.yaml")
+            if lighter_config_path.exists():
+                with open(lighter_config_path, 'r', encoding='utf-8') as f:
+                    lighter_config_data = yaml.safe_load(f)
+                api_config = lighter_config_data.get('api_config', {})
+                auth_config = api_config.get('auth', {})
+
+                exchange_config = ExchangeConfig(
+                    exchange_id="lighter",
+                    name="Lighter",
+                    exchange_type=market_type,
+                    api_key="",  # Lighter适配器内部从配置文件读取
+                    api_secret="",  # Lighter适配器内部从配置文件读取
+                    testnet=api_config.get('testnet', False),
+                    enable_websocket=True,
+                    enable_auto_reconnect=True
+                )
+                print(f"   ✓ Lighter配置加载成功（适配器将自动读取API密钥）")
+            else:
+                print(f"   ⚠️  未找到Lighter配置文件: {lighter_config_path}")
+                exchange_config = ExchangeConfig(
+                    exchange_id="lighter",
+                    name="Lighter",
+                    exchange_type=market_type,
+                    api_key="",
+                    api_secret="",
+                    testnet=False,
+                    enable_websocket=True,
+                    enable_auto_reconnect=True
+                )
+        except Exception as e:
+            print(f"   ⚠️  加载Lighter配置失败: {e}")
+            exchange_config = ExchangeConfig(
+                exchange_id="lighter",
+                name="Lighter",
+                exchange_type=market_type,
+                api_key="",
+                api_secret="",
+                testnet=False,
+                enable_websocket=True,
+                enable_auto_reconnect=True
+            )
+    else:
+        # 其他交易所使用标准配置
+        exchange_config = ExchangeConfig(
+            exchange_id=exchange_name,
+            name=exchange_name.capitalize(),
+            exchange_type=market_type,  # 🔥 使用自动检测的市场类型
+            api_key=api_key or "",
+            api_secret=api_secret or "",
+            wallet_address=wallet_address,  # Hyperliquid 需要
+            testnet=False,
+            enable_websocket=True,
+            enable_auto_reconnect=True
+        )
 
     # 使用工厂创建适配器
     factory = ExchangeFactory()
@@ -294,19 +363,57 @@ async def create_exchange_adapter(config_data: dict):
     return adapter
 
 
-async def main(config_path: str = "config/grid/default_grid.yaml"):
+async def main(config_path: str = "config/grid/default_grid.yaml", debug: bool = False):
     """
     主函数
 
     Args:
         config_path: 配置文件路径
+        debug: 是否启用DEBUG模式
     """
-    logger = get_system_logger()
+    # 🔥 如果启用 DEBUG 模式，设置日志级别
+    if debug:
+        # 设置根日志级别为 DEBUG
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    try:
+        # 设置核心模块的日志级别为 DEBUG
+        for module in ['core.services.grid', 'core.adapters.exchanges', 'ExchangeAdapter']:
+            logging.getLogger(module).setLevel(logging.DEBUG)
+
+        # 🔥 为 lighter_websocket 添加文件handler，确保调试日志能写入文件
+        lighter_ws_logger = logging.getLogger(
+            'core.adapters.exchanges.adapters.lighter_websocket')
+        lighter_ws_logger.setLevel(logging.DEBUG)
+
+        # 添加文件handler到 ExchangeAdapter.log
+        from logging.handlers import RotatingFileHandler
+        ws_handler = RotatingFileHandler(
+            'logs/ExchangeAdapter.log',
+            maxBytes=10*1024*1024,  # 10MB
+            backupCount=3,
+            encoding='utf-8'
+        )
+        ws_handler.setLevel(logging.DEBUG)
+        ws_formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+        )
+        ws_handler.setFormatter(ws_formatter)
+        lighter_ws_logger.addHandler(ws_handler)
+        lighter_ws_logger.propagate = False  # 不传播到父logger，避免重复
+
+        print("=" * 70)
+        print("🔥 网格交易系统启动 - DEBUG 模式")
+        print("=" * 70)
+        print("⚠️  DEBUG模式已启用：将输出详细的调试信息")
+        print("=" * 70)
+    else:
         print("=" * 70)
         print("🎯 网格交易系统启动")
         print("=" * 70)
+
+    logger = get_system_logger()
+
+    try:
 
         # 1. 加载配置
         print("\n📋 步骤 1/6: 加载配置文件...")
@@ -496,91 +603,107 @@ async def main(config_path: str = "config/grid/default_grid.yaml"):
             print(f"⚠️  清理过程出错: {e}")
 
 
-def print_usage():
-    """打印使用说明"""
-    print("""
-使用方法:
-    python3 run_grid_trading.py [配置文件路径]
+def parse_arguments():
+    """
+    解析命令行参数
 
+    Returns:
+        argparse.Namespace: 解析后的参数
+    """
+    parser = argparse.ArgumentParser(
+        description='网格交易系统 - 支持多交易所的自动化网格交易',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
 示例:
-    # 🔸 Backpack 交易所
-    python3 run_grid_trading.py config/grid/backpack_capital_protection_long_btc.yaml
-    
-    # 🔹 Hyperliquid 交易所 - 永续合约
-    python3 run_grid_trading.py config/grid/hyperliquid_btc_perp_long.yaml   # 做多
-    python3 run_grid_trading.py config/grid/hyperliquid_btc_perp_short.yaml  # 做空
-    
-    # 🔹 Hyperliquid 交易所 - 现货（仅支持做多）
-    python3 run_grid_trading.py config/grid/hyperliquid_btc_spot_long.yaml   # 做多
-
-配置文件说明:
-    📂 Backpack 交易所配置:
-    - config/grid/backpack_capital_protection_long_*.yaml  # 做多网格（多币种）
-    - config/grid/backpack_capital_protection_short.yaml   # 做空网格
-    
-    📂 Hyperliquid 交易所配置:
-    - config/grid/hyperliquid_btc_perp_long.yaml   # BTC永续做多
-    - config/grid/hyperliquid_btc_perp_short.yaml  # BTC永续做空
-    - config/grid/hyperliquid_btc_spot_long.yaml   # BTC现货做多
+  # 正常模式启动
+  python3 run_grid_trading.py config/grid/lighter_btc_perp_long.yaml
+  
+  # DEBUG 模式启动（输出详细日志）
+  python3 run_grid_trading.py config/grid/lighter_btc_perp_long.yaml --debug
+  
+  # 🔸 Backpack 交易所
+  python3 run_grid_trading.py config/grid/backpack_capital_protection_long_btc.yaml
+  
+  # 🔹 Hyperliquid 交易所
+  python3 run_grid_trading.py config/grid/hyperliquid_btc_perp_long.yaml
+  
+  # 🔶 Lighter 交易所
+  python3 run_grid_trading.py config/grid/lighter_btc_perp_long.yaml --debug
 
 支持的交易所:
-    ✅ Backpack   - 永续合约（做多/做空）
-    ✅ Hyperliquid - 永续合约（做多/做空）、现货（仅做多）
+  ✅ Backpack    - 永续合约（做多/做空）
+  ✅ Hyperliquid - 永续合约（做多/做空）、现货（仅做多）
+  ✅ Lighter     - 永续合约（做多/做空）
 
 注意事项:
-    1. 确保API密钥已正确配置
-    2. 确保有足够的资金用于网格交易
-    3. 建议先用小额资金测试
-    4. ⚠️  现货市场只支持做多，不支持做空
-    5. 网格系统会永久运行，除非手动停止
-    6. 使用 Ctrl+C 或 Q 键安全退出系统
+  1. 确保API密钥已正确配置
+  2. 确保有足够的资金用于网格交易
+  3. 建议先用小额资金测试
+  4. ⚠️  现货市场只支持做多，不支持做空
+  5. 网格系统会永久运行，除非手动停止
+  6. 使用 Ctrl+C 或 Q 键安全退出系统
+  7. DEBUG 模式会输出详细日志，适合排查问题
+        """
+    )
 
-API密钥配置:
-    方式1: 环境变量
-        export BACKPACK_API_KEY="your_api_key"
-        export BACKPACK_API_SECRET="your_api_secret"
-        
-        export HYPERLIQUID_API_KEY="your_private_key"
-        export HYPERLIQUID_API_SECRET="your_private_key"
-        export HYPERLIQUID_WALLET_ADDRESS="your_wallet_address"
-    
-    方式2: 配置文件
-        编辑 config/exchanges/{exchange_name}_config.yaml
-    """)
+    parser.add_argument(
+        'config',
+        type=str,
+        help='网格配置文件路径 (例如: config/grid/lighter_btc_perp_long.yaml)'
+    )
+
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='启用DEBUG模式，输出详细的调试日志'
+    )
+
+    parser.add_argument(
+        '--version',
+        action='version',
+        version='网格交易系统 v2.0.0'
+    )
+
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    # 检查命令行参数
-    config_path = "config/grid/default_grid.yaml"
-
-    if len(sys.argv) > 1:
-        if sys.argv[1] in ['-h', '--help', 'help']:
-            print_usage()
-            sys.exit(0)
-
-        # 支持 --config 格式
-        if sys.argv[1] == '--config' or sys.argv[1] == '-c':
-            if len(sys.argv) > 2:
-                config_path = sys.argv[2]
-            else:
-                print("❌ --config 参数需要指定配置文件路径")
-                print("\n使用 -h 或 --help 查看使用说明")
-                sys.exit(1)
-        else:
-            # 直接传入配置文件路径
-            config_path = sys.argv[1]
-
-    # 检查配置文件是否存在
-    if not Path(config_path).exists():
-        print(f"❌ 配置文件不存在: {config_path}")
-        print("\n使用 -h 或 --help 查看使用说明")
-        sys.exit(1)
-
     try:
+        # 解析命令行参数
+        args = parse_arguments()
+
+        # 获取配置文件路径
+        config_path = args.config
+
+        # 检查配置文件是否存在
+        if not Path(config_path).exists():
+            print(f"❌ 配置文件不存在: {config_path}")
+            print("\n使用 -h 或 --help 查看使用说明")
+            sys.exit(1)
+
+        # 如果启用 DEBUG 模式，显示提示
+        if args.debug:
+            print("\n" + "=" * 70)
+            print("🔥 DEBUG 模式已启用")
+            print("=" * 70)
+            print("📝 将输出详细的调试日志，包括：")
+            print("   - WebSocket 消息详情")
+            print("   - REST API 调用参数")
+            print("   - 订单匹配逻辑")
+            print("   - 持仓和余额更新")
+            print("=" * 70)
+            print()
+
         # 运行主程序
-        asyncio.run(main(config_path))
+        asyncio.run(main(config_path, debug=args.debug))
+
     except KeyboardInterrupt:
         print("\n👋 程序已退出")
+    except SystemExit:
+        # argparse 的 --help 或 --version 会触发 SystemExit
+        pass
     except Exception as e:
         print(f"\n❌ 启动失败: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
