@@ -156,6 +156,9 @@ class PositionMonitor:
                     entry_price = Decimal('0')
                 else:
                     position = positions[0]
+                    # 🔥 统一使用传统规则（系统内部表示）
+                    # LONG(多头) = 正数, SHORT(空头) = 负数
+                    # Lighter适配器已经在get_positions中完成了方向转换
                     position_qty = position.size if position.side.value.lower() == 'long' else - \
                         position.size
                     entry_price = position.entry_price

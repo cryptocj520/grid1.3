@@ -170,22 +170,25 @@ class GridStrategyImpl(IGridStrategy):
         if filled_order.is_buy_order():
             # 买单成交 → 挂卖单
             new_side = GridOrderSide.SELL
-            new_price = filled_order.filled_price + (grid_interval * distance)
+            # 🔥 关键修复：使用【下单价格】而非【成交价格】计算反手价格
+            # 这样可以保证网格间距的一致性，避免市价成交导致间距错乱
+            new_price = filled_order.price + (grid_interval * distance)
             # 网格ID保持不变或向上移动（取决于具体实现）
             new_grid_id = filled_order.grid_id
 
             self.logger.debug(
-                f"买单成交@{filled_order.filled_price}, "
+                f"买单成交 (下单价@{filled_order.price}, 成交价@{filled_order.filled_price}), "
                 f"挂卖单@{new_price} (向上移动{distance}格，距离{grid_interval * distance})"
             )
         else:
             # 卖单成交 → 挂买单
             new_side = GridOrderSide.BUY
-            new_price = filled_order.filled_price - (grid_interval * distance)
+            # 🔥 关键修复：使用【下单价格】而非【成交价格】计算反手价格
+            new_price = filled_order.price - (grid_interval * distance)
             new_grid_id = filled_order.grid_id
 
             self.logger.debug(
-                f"卖单成交@{filled_order.filled_price}, "
+                f"卖单成交 (下单价@{filled_order.price}, 成交价@{filled_order.filled_price}), "
                 f"挂买单@{new_price} (向下移动{distance}格，距离{grid_interval * distance})"
             )
 

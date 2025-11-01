@@ -29,13 +29,15 @@ class LogConfig:
                  file_level: str = "DEBUG",
                  max_file_size: int = 5 * 1024 *
                  1024,  # 5MB (与 logging.yaml 保持一致)
-                 backup_count: int = 3):  # 3个备份 (与 logging.yaml 保持一致)
+                 backup_count: int = 3,  # 3个备份 (与 logging.yaml 保持一致)
+                 enable_console: bool = True):  # 🔥 新增：是否启用控制台输出
         self.log_dir = log_dir
         self.level = getattr(logging, level.upper())
         self.console_level = getattr(logging, console_level.upper())
         self.file_level = getattr(logging, file_level.upper())
         self.max_file_size = max_file_size
         self.backup_count = backup_count
+        self.enable_console = enable_console
 
         # 确保日志目录存在
         Path(log_dir).mkdir(parents=True, exist_ok=True)
@@ -57,16 +59,17 @@ class BaseLogger:
         # 清除现有处理器
         self.logger.handlers.clear()
 
-        # 添加控制台处理器
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(self.config.console_level)
-        console_formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        console_handler.setFormatter(console_formatter)
-        self.logger.addHandler(console_handler)
+        # 🔥 只有启用控制台输出时才添加控制台处理器
+        if self.config.enable_console:
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(self.config.console_level)
+            console_formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            console_handler.setFormatter(console_formatter)
+            self.logger.addHandler(console_handler)
 
-        # 添加文件处理器
+        # 添加文件处理器（始终启用）
         log_file = os.path.join(self.config.log_dir, f"{self.name}.log")
         file_handler = RotatingFileHandler(
             log_file,
@@ -321,10 +324,17 @@ def get_performance_logger() -> PerformanceLogger:
     return _loggers["performance"]
 
 
-def initialize_logging(log_dir: str = "logs", level: str = "INFO") -> bool:
-    """初始化日志系统"""
+def initialize_logging(log_dir: str = "logs", level: str = "INFO", enable_console: bool = True) -> bool:
+    """初始化日志系统
+
+    Args:
+        log_dir: 日志目录
+        level: 日志级别
+        enable_console: 是否启用控制台输出（默认True）
+    """
     try:
-        config = LogConfig(log_dir=log_dir, level=level)
+        config = LogConfig(log_dir=log_dir, level=level,
+                           enable_console=enable_console)
         set_config(config)
 
         # 清理已有实例，使用新配置

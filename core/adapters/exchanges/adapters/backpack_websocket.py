@@ -54,12 +54,29 @@ class BackpackWebSocket(BackpackBase):
         self._position_cache = {}
         self._position_callbacks = []  # 持仓更新回调函数列表
 
-        # 🔥 新增：混合心跳模式参数 (参考Hyperliquid)
-        self._last_ping_time = 0      # 上次发送ping的时间
-        self._last_pong_time = 0      # 上次收到pong的时间
-        self._ping_interval = 25      # 25秒ping间隔 (更积极)
-        self._pong_timeout = 50       # 50秒无pong响应则重连
-        self._message_timeout = 70    # 70秒无任何消息则重连 (更积极)
+        # ============================================================================
+        # 🔥 心跳检测参数（基于Backpack官方规范 + aiohttp实现）
+        # ============================================================================
+        # 📌 Backpack 官方文档 - Keeping the connection alive:
+        #
+        # "To keep the connection alive, a Ping frame will be sent from the
+        #  server every 60s, and a Pong is expected to be received from the
+        #  client. If a Pong is not received within 120s, a Close frame will
+        #  be sent and the connection will be closed.
+        #
+        #  If the server is shutting down, a Close frame will be sent and then
+        #  a grace period of 30s will be given before the connection is closed.
+        #  The client should reconnect after receiving the Close frame. The
+        #  client will be reconnected to a server that is not shutting down."
+        #
+        # 🔑 重要实现细节：
+        #   - aiohttp 在底层（C扩展）自动处理 Ping/Pong，应用层看不到
+        #   - 我们不应该监控服务器Ping（因为看不到）
+        #   - 应该信任 aiohttp 的自动 Ping/Pong 机制
+        #   - 只需监控连接状态（closed）和业务消息活跃度
+        # ============================================================================
+        # 注意：长时间无业务消息是正常现象（如等待价格变化期间无订单成交）
+        # 因此不使用业务消息超时作为重连触发条件
 
         # 缓存相关
         self._latest_orderbooks: Dict[str, Dict[str, Any]] = {}
@@ -144,10 +161,7 @@ class BackpackWebSocket(BackpackBase):
             self._reconnecting = False
             self._heartbeat_should_stop = False  # 🔧 修复：重置心跳停止标志
 
-            # 🔥 新增：初始化ping/pong时间戳
-            current_time = time.time()
-            self._last_ping_time = current_time
-            self._last_pong_time = current_time
+            # 不再需要监控服务器ping时间，aiohttp自动处理
 
             # 启动消息处理任务
             self._ws_handler_task = asyncio.create_task(
@@ -246,16 +260,24 @@ class BackpackWebSocket(BackpackBase):
             self._ws_connected = False
             self._ws_connection = None
 
-    async def _send_ping(self) -> None:
-        """发送标准WebSocket ping消息"""
-        try:
-            if self._ws_connection and self._ws_connected and not self._ws_connection.closed:
-                await self._ws_connection.ping()
-                if self.logger:
-                    self.logger.debug("🏓 发送WebSocket ping")
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"❌ 发送ping失败: {str(e)}")
+    # ============================================================================
+    # 🚫 已废弃：客户端主动发送Ping（不符合Backpack官方规范）
+    # ============================================================================
+    # 根据Backpack官方文档，心跳机制是：
+    #   - 服务器每60秒发送Ping → 客户端响应Pong（aiohttp自动处理）
+    #   - 客户端不应该主动发送Ping
+    # 因此此方法已废弃，保留仅供参考
+    # ============================================================================
+    # async def _send_ping(self) -> None:
+    #     """发送标准WebSocket ping消息（已废弃）"""
+    #     try:
+    #         if self._ws_connection and self._ws_connected and not self._ws_connection.closed:
+    #             await self._ws_connection.ping()
+    #             if self.logger:
+    #                 self.logger.debug("🏓 发送WebSocket ping")
+    #     except Exception as e:
+    #         if self.logger:
+    #             self.logger.error(f"❌ 发送ping失败: {str(e)}")
 
     async def _websocket_heartbeat_loop(self):
         """WebSocket混合心跳检测循环 - 主动ping + 被动检测 (参考Hyperliquid)"""
@@ -290,57 +312,26 @@ class BackpackWebSocket(BackpackBase):
                         await self._trigger_reconnection("连接断开")
                         continue
 
-                    # === 🔥 主动ping检测机制 ===
-                    if current_time - self._last_ping_time >= self._ping_interval:
-                        await self._send_ping()
-                        self._last_ping_time = current_time
-                        if self.logger:
-                            self.logger.debug(f"🏓 主动ping检测: 已发送ping")
+                    # === 📡 核心监控：WebSocket连接状态 ===
+                    # ⚠️ 重要：aiohttp在底层自动处理Ping/Pong，应用层看不到
+                    # - Backpack服务器每60秒发送Ping
+                    # - aiohttp自动响应Pong（在C扩展层）
+                    # - 如果120秒不响应，服务器会主动Close连接
+                    # - 我们只需要信任aiohttp的自动处理，监控连接状态即可
 
-                    # === 💌 主要检测：数据流心跳（优先级最高）===
+                    # 💡 业务消息监控（仅用于调试，不触发重连）
                     message_silence = current_time - self._last_heartbeat
-                    if message_silence >= self._message_timeout:
-                        if self.logger:
-                            self.logger.warning(
-                                f"⚠️ Backpack WebSocket消息超时: "
-                                f"{message_silence:.1f}s无任何消息，触发重连..."
-                            )
-                        await self._trigger_reconnection("消息超时")
-                        continue
 
-                    # === 📡 辅助检测：ping/pong超时（更宽松的超时时间）===
-                    # 🔧 修复：调整ping/pong超时逻辑，只有在数据流也异常时才重连
-                    pong_silence = current_time - self._last_pong_time if self._last_pong_time > 0 else 0
-                    if (self._last_pong_time > 0 and
-                        pong_silence >= self._pong_timeout * 2 and  # 💡 延长至120秒
-                            message_silence >= 30):  # 💡 且数据流也静默30秒以上
-                        if self.logger:
-                            self.logger.warning(
-                                f"⚠️ Backpack WebSocket ping/pong异常: "
-                                f"{pong_silence:.1f}s无pong响应，且{message_silence:.1f}s无消息，触发重连..."
-                            )
-                        await self._trigger_reconnection("ping/pong异常")
-                        continue
-
-                    # === ✅ 正常状态日志 ===
-                    if self.logger:
-                        ping_status = f"{current_time - self._last_ping_time:.1f}s前ping"
-                        if self._last_pong_time > 0:
-                            pong_status = f"{pong_silence:.1f}s前pong"
-                        else:
-                            pong_status = "无pong"
-                        message_status = f"{message_silence:.1f}s前消息"
-
-                        # 💡 区分正常状态和轻微异常
-                        if pong_silence > self._pong_timeout and message_silence < 30:
-                            # ping/pong异常但数据流正常
+                    # === ✅ 状态日志（每60秒输出一次） ===
+                    if self.logger and int(current_time) % 60 == 0:
+                        if message_silence > 300:  # 5分钟无业务消息时提示
                             self.logger.debug(
-                                f"💓 Backpack心跳状态: {ping_status}, {pong_status}(异常但数据流正常), {message_status}"
+                                f"💓 Backpack连接正常（aiohttp自动Ping/Pong），"
+                                f"但{message_silence:.1f}s无业务消息（等待订单成交/行情变化）"
                             )
                         else:
-                            # 一切正常
                             self.logger.debug(
-                                f"💓 Backpack心跳正常: {ping_status}, {pong_status}, {message_status}"
+                                f"💓 Backpack连接正常，{message_silence:.1f}s前收到消息"
                             )
 
                 except asyncio.CancelledError:
@@ -386,9 +377,14 @@ class BackpackWebSocket(BackpackBase):
         try:
             if self.logger:
                 self.logger.info(f"🔄 [心跳调试] 开始执行重连 (原因: {reason})...")
-            await self._reconnect_websocket()
-            if self.logger:
+
+            success = await self._reconnect_websocket()
+
+            # 只有真正执行了重连才记录"重连完成"
+            if success and self.logger:
                 self.logger.info("✅ [心跳调试] 重连完成")
+            elif not success and self.logger:
+                self.logger.warning("⚠️ [心跳调试] 重连被跳过（网络不可达或其他原因）")
         except asyncio.CancelledError:
             if self.logger:
                 self.logger.warning("⚠️ [心跳调试] 重连被取消")
@@ -400,8 +396,13 @@ class BackpackWebSocket(BackpackBase):
             # 清除重连状态标记
             self._reconnecting = False
 
-    async def _reconnect_websocket(self):
-        """WebSocket自动重连 - 无限重试 + 指数退避 + 网络诊断"""
+    async def _reconnect_websocket(self) -> bool:
+        """
+        WebSocket自动重连 - 无限重试 + 指数退避 + 网络诊断
+
+        Returns:
+            bool: True=重连成功, False=跳过重连（网络不可达等）
+        """
         base_delay = 2
         max_delay = 300  # 最大延迟5分钟
 
@@ -416,8 +417,6 @@ class BackpackWebSocket(BackpackBase):
             self.logger.info(
                 f"🔄 [重连调试] Backpack重连尝试 #{self._reconnect_attempts}，延迟{delay}s")
 
-        reconnect_success = False
-
         try:
             # 步骤1: 网络诊断
             if self.logger:
@@ -428,7 +427,7 @@ class BackpackWebSocket(BackpackBase):
             if not network_ok:
                 if self.logger:
                     self.logger.warning("⚠️ 基本网络连通性检查失败，跳过本次重连")
-                return  # 网络不通，跳过本次重连
+                return False  # 网络不通，返回 False 表示跳过重连
 
             # 检查交易所服务器连通性
             exchange_ok = await self._check_exchange_connectivity()
@@ -462,16 +461,15 @@ class BackpackWebSocket(BackpackBase):
                 # 步骤6: 重置状态 - 重连成功，重置计数
                 self._reconnect_attempts = 0
                 self._last_heartbeat = time.time()
-
-                # 🔥 新增：重置ping/pong时间戳
-                current_time = time.time()
-                self._last_ping_time = current_time
-                self._last_pong_time = current_time
+                # aiohttp自动处理Ping/Pong，无需手动管理
 
                 if self.logger:
                     self.logger.info("🎉 [重连调试] Backpack WebSocket重连成功！")
+                return True  # 重连成功
             else:
-                raise Exception("连接建立失败")
+                if self.logger:
+                    self.logger.error("❌ [重连调试] 连接建立失败")
+                return False  # 连接失败
 
         except asyncio.CancelledError:
             if self.logger:
@@ -485,16 +483,8 @@ class BackpackWebSocket(BackpackBase):
                 import traceback
                 self.logger.error(f"[重连调试] 完整错误堆栈: {traceback.format_exc()}")
 
-            # 重连失败处理 - 无限重试模式
-            reconnect_success = False
-
-        # 无限重试：重连失败也不停止，继续让心跳检测工作
-        if not reconnect_success:
-            if self.logger:
-                self.logger.warning(
-                    f"⚠️ Backpack重连失败，将在下次心跳检测时继续重试 (已尝试{self._reconnect_attempts}次)")
-            # 保持连接状态为True，让心跳检测继续工作
-            # 不停止心跳任务，实现真正的无限重试
+            # 重连失败，返回 False
+            return False
 
     async def _cleanup_old_connections(self):
         """彻底清理旧的连接和任务（应用EdgeX修复）"""
@@ -640,16 +630,16 @@ class BackpackWebSocket(BackpackBase):
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     message = msg.data
                     await self._process_websocket_message(message)
+                elif msg.type == aiohttp.WSMsgType.PING:
+                    # aiohttp在底层自动处理Ping/Pong（C扩展层）
+                    # 这里不会执行到，因为aiohttp在应用层之前就处理了
+                    # 保留此分支仅供文档说明
+                    pass
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     if self.logger:
                         self.logger.error(
                             f"Backpack WebSocket错误: {self._ws_connection.exception()}")
                     break
-                elif msg.type == aiohttp.WSMsgType.PONG:
-                    # 🔥 新增：处理pong响应
-                    self._last_pong_time = time.time()
-                    if self.logger:
-                        self.logger.debug("🏓 收到WebSocket pong响应")
                 elif msg.type == aiohttp.WSMsgType.CLOSE:
                     if self.logger:
                         self.logger.warning("Backpack WebSocket连接已关闭")

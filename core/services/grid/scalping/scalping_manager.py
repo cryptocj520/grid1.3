@@ -75,6 +75,12 @@ class ScalpingManager:
             做多网格：Grid 1 = 最低价，当价格跌到前N%区域时触发
             做空网格：Grid 1 = 最高价，当价格涨到前N%区域时触发
         """
+        # 🔥 价格有效性检查：如果价格为0或无效，不触发剥头皮
+        if current_price <= 0:
+            self.logger.debug(
+                f"⏸️  价格无效（{current_price}），跳过剥头皮检查")
+            return False
+
         if self._is_scalping_active:
             return False  # 已经在剥头皮模式中
 
@@ -116,6 +122,12 @@ class ScalpingManager:
             做多网格：Grid 1 = 最低价，当价格反弹回高位时退出
             做空网格：Grid 1 = 最高价，当价格回落到高位时退出
         """
+        # 🔥 价格有效性检查：如果价格为0或无效，不处理退出逻辑
+        if current_price <= 0:
+            self.logger.debug(
+                f"⏸️  价格无效（{current_price}），跳过剥头皮退出检查")
+            return False
+
         if not self._is_scalping_active:
             return False  # 不在剥头皮模式中
 

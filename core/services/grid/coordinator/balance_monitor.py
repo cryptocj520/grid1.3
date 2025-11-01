@@ -129,7 +129,7 @@ class BalanceMonitor:
                 # 从 raw_data 中提取详细的余额信息
                 raw_data = usdc_balance.raw_data
 
-                # 🔥 支持多交易所：Backpack vs Hyperliquid
+                # 🔥 支持多交易所：Backpack vs Hyperliquid vs Lighter
                 exchange_name = self.config.exchange.lower() if hasattr(
                     self.config, 'exchange') else 'backpack'
 
@@ -141,6 +141,17 @@ class BalanceMonitor:
                         raw_data.get('total', '0'))  # Hyperliquid的总余额
                     self._order_locked_balance = self._safe_decimal(
                         raw_data.get('used', '0'))  # 订单冻结资产
+                elif exchange_name == 'lighter':
+                    # Lighter格式：BalanceData 直接包含 free, used, total
+                    # Lighter是合约交易所，只有USDC保证金
+                    self._spot_balance = usdc_balance.free  # 可用余额
+                    self._collateral_balance = usdc_balance.total  # 总余额（包含冻结）
+                    self._order_locked_balance = usdc_balance.used  # 订单冻结资产
+
+                    self.logger.debug(
+                        f"📊 Lighter余额: 可用={self._spot_balance}, "
+                        f"总额={self._collateral_balance}, 冻结={self._order_locked_balance}"
+                    )
                 else:
                     # Backpack格式：使用账户级别的净资产字段
                     # netEquity = 总净资产（包含未实现盈亏 + 订单冻结）

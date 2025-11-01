@@ -1,0 +1,224 @@
+# Lighter交易所配置文件
+
+exchange_id: "lighter"
+exchange_name: "Lighter"
+
+# API配置
+api_config:
+  # API端点
+  mainnet_url: "https://mainnet.zklighter.elliot.ai"
+  testnet_url: "https://testnet.zklighter.elliot.ai"
+  ws_mainnet_url: "wss://mainnet.zklighter.elliot.ai/stream"
+  ws_testnet_url: "wss://testnet.zklighter.elliot.ai/stream"
+  
+  # 默认使用主网
+  testnet: false
+  
+  # API认证配置
+  # 注意：这些信息需要在实际使用时配置
+  # API_KEY_PRIVATE_KEY: 从Lighter前端生成的API Key私钥（带0x前缀）
+  # ACCOUNT_INDEX: 账户索引
+  # API_KEY_INDEX: API Key索引
+  auth:
+    api_key_private_key: "11111111111111111111111111111111111111111111111111111111111111111111111"  # 需要配置
+    account_index: 11111          # 账户索引 (十进制)
+    api_key_index: 11             # API Key索引
+  
+  # SDK安装说明
+  sdk_install_command: "pip install git+https://github.com/elliottech/lighter-python.git"
+
+# 订阅模式配置
+subscription_mode:
+  # 模式: "predefined" (预定义符号列表) 或 "discovery" (自动发现)
+  mode: "predefined"
+  
+  # 预定义模式配置
+  predefined:
+    # 要订阅的交易对列表
+    symbols:
+      - "BTC-USD"
+      - "ETH-USD"
+      - "SOL-USD"
+    
+    # 要订阅的数据类型
+    data_types:
+      ticker: true       # 订阅ticker数据
+      orderbook: true    # 订阅订单簿
+      trades: false      # 订阅成交数据（按需开启）
+      user_data: false   # 订阅用户数据（需要配置API密钥）
+  
+  # 自动发现模式配置
+  discovery:
+    enabled: false
+    # 发现规则
+    rules:
+      - type: "volume_threshold"
+        min_volume_24h: 1000000  # 最小24小时成交量（USD）
+      - type: "quote_currency"
+        currencies: ["USD", "USDT", "USDC"]
+
+# 符号映射配置
+symbol_mapping:
+  # 内部符号 -> Lighter符号
+  "BTCUSD": "BTC-USD"
+  "ETHUSD": "ETH-USD"
+  "SOLUSD": "SOL-USD"
+
+# 速率限制配置
+rate_limits:
+  # REST API限制
+  rest:
+    ticker:
+      max_requests: 100
+      time_window: 60  # 秒
+    orderbook:
+      max_requests: 100
+      time_window: 60
+    trading:
+      max_requests: 10
+      time_window: 60
+    account:
+      max_requests: 20
+      time_window: 60
+  
+  # WebSocket限制
+  websocket:
+    max_subscriptions: 100
+    max_reconnect_attempts: 10
+    reconnect_delay: 5  # 秒
+
+# WebSocket配置
+websocket:
+  # 是否启用WebSocket
+  enabled: true
+  
+  # 心跳配置
+  heartbeat:
+    enabled: true
+    interval: 30  # 秒
+  
+  # 重连配置
+  reconnect:
+    enabled: true
+    max_attempts: 10
+    initial_delay: 1   # 秒
+    max_delay: 30      # 秒
+    exponential_backoff: true
+
+# 交易配置
+trading:
+  # 默认订单配置
+  default_order:
+    time_in_force: "GTT"  # GTT, IOC, POST_ONLY
+    order_type: "LIMIT"    # LIMIT, MARKET
+  
+  # 市价单配置
+  market_order:
+    max_slippage: 0.01  # 1% 最大滑点
+  
+  # 限价单配置
+  limit_order:
+    default_time_in_force: "GTT"
+    post_only: false
+
+# 保证金配置
+margin:
+  # 默认保证金模式
+  default_mode: "cross"  # cross 或 isolated
+  
+  # 默认杠杆
+  default_leverage: 1
+
+# 精度配置
+precision:
+  # 价格精度（小数位数）
+  price: 8
+  
+  # 数量精度（小数位数）
+  quantity: 8
+  
+  # 金额精度
+  amount: 8
+
+# 缓存配置
+cache:
+  # 市场信息缓存时间（秒）
+  market_info_ttl: 3600
+  
+  # 订单簿缓存时间
+  orderbook_ttl: 5
+  
+  # ticker缓存时间
+  ticker_ttl: 1
+
+# 日志配置
+logging:
+  # 日志级别
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  
+  # 是否启用详细日志
+  verbose: false
+  
+  # 日志文件路径（可选）
+  log_file: "logs/lighter_adapter.log"
+
+# 功能开关
+features:
+  # 是否支持WebSocket
+  websocket_enabled: true
+  
+  # 是否支持用户数据流
+  user_data_stream: true
+  
+  # 是否支持杠杆交易
+  leverage_trading: true
+  
+  # 是否支持保证金模式切换
+  margin_mode_switch: true
+  
+  # 是否支持止损止盈订单
+  stop_orders: true
+
+# 监控配置
+monitoring:
+  # 健康检查间隔（秒）
+  health_check_interval: 60
+  
+  # 连接超时（秒）
+  connection_timeout: 30
+  
+  # 请求超时（秒）
+  request_timeout: 10
+
+# 使用说明
+usage:
+  setup_steps:
+    - "1. 访问 https://app.lighter.xyz 注册账户"
+    - "2. 在前端创建API Key，保存Private Key"
+    - "3. 安装Lighter SDK: pip install git+https://github.com/elliottech/lighter-python.git"
+    - "4. 配置本文件中的api_key_private_key、account_index和api_key_index"
+    - "5. 在程序中使用LighterAdapter"
+  
+  important_notes:
+    - "Lighter使用zkRollup技术，交易需要签名"
+    - "API Key私钥必须保密，不要提交到代码仓库"
+    - "测试时建议先使用testnet: true"
+    - "市场索引(market_index)对应交易对，需要通过API获取"
+
+# 示例配置
+examples:
+  # 基本配置示例
+  basic:
+    testnet: false
+    auth:
+      api_key_private_key: "0x..."
+      account_index: 1
+      api_key_index: 0
+  
+  # 测试网配置示例
+  testnet:
+    testnet: true
+    auth:
+      api_key_private_key: "0x..."
+      account_index: 65
+      api_key_index: 1

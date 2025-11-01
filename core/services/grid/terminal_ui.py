@@ -46,7 +46,7 @@ class GridTerminalUI:
         self.console = Console()
 
         # 界面配置
-        self.refresh_rate = 1  # 刷新频率（次/秒）- 降低刷新率减少闪烁
+        self.refresh_rate = 2  # 刷新频率（次/秒）- 降低刷新率减少闪烁
         self.history_limit = 10  # 显示历史记录数
 
         # 运行控制
@@ -255,34 +255,35 @@ class GridTerminalUI:
         content.append(f"{mode_icon} {monitoring_mode}", style=mode_style)
         content.append("\n")
 
-        # 🔥 计算网格范围（根据修复后的网格顺序）
-        # 做多网格：Grid 1 = 最低价，买单在下方，卖单在上方
-        # 做空网格：Grid 1 = 最高价，卖单在上方，买单在下方
-        is_long = self.coordinator.config.grid_type in [
-            GridType.LONG, GridType.MARTINGALE_LONG, GridType.FOLLOW_LONG]
+        # 🔥 修复：从实际订单中获取Grid ID范围，而不是基于current_grid_id猜测
+        # 这样可以准确显示实际挂单的网格范围
+        buy_grid_ids = []
+        sell_grid_ids = []
 
-        if is_long:
-            # 做多：买单在下方（Grid 1到current），卖单在上方（current+1到200）
-            if stats.pending_buy_orders > 0:
-                buy_range = f"Grid 1-{stats.current_grid_id}"
-            else:
-                buy_range = "无"
+        # 从coordinator的state中获取实际订单
+        if hasattr(self.coordinator, 'state') and hasattr(self.coordinator.state, 'active_orders'):
+            for order in self.coordinator.state.active_orders.values():
+                if hasattr(order, 'grid_id') and order.grid_id:
+                    if order.side == GridOrderSide.BUY:
+                        buy_grid_ids.append(order.grid_id)
+                    elif order.side == GridOrderSide.SELL:
+                        sell_grid_ids.append(order.grid_id)
 
-            if stats.pending_sell_orders > 0:
-                sell_range = f"Grid {stats.current_grid_id + 1}-{stats.grid_count}"
-            else:
-                sell_range = "无"
+        # 计算买单范围
+        if buy_grid_ids:
+            min_buy = min(buy_grid_ids)
+            max_buy = max(buy_grid_ids)
+            buy_range = f"Grid {min_buy}-{max_buy}" if min_buy != max_buy else f"Grid {min_buy}"
         else:
-            # 做空：卖单在上方（Grid 1到current），买单在下方（current+1到200）
-            if stats.pending_sell_orders > 0:
-                sell_range = f"Grid 1-{stats.current_grid_id}"
-            else:
-                sell_range = "无"
+            buy_range = "无"
 
-            if stats.pending_buy_orders > 0:
-                buy_range = f"Grid {stats.current_grid_id + 1}-{stats.grid_count}"
-            else:
-                buy_range = "无"
+        # 计算卖单范围
+        if sell_grid_ids:
+            min_sell = min(sell_grid_ids)
+            max_sell = max(sell_grid_ids)
+            sell_range = f"Grid {min_sell}-{max_sell}" if min_sell != max_sell else f"Grid {min_sell}"
+        else:
+            sell_range = "无"
 
         content.append(
             f"├─ 未成交买单: {stats.pending_buy_orders}个 ({buy_range}) ⏳\n", style="green")

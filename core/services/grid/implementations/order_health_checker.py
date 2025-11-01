@@ -213,7 +213,7 @@ class OrderHealthChecker:
                     Decimal(str(filled_sell_count)) * self.config.order_amount
 
         else:
-            self.logger.warning(f"未知的网格类型: {self.config.grid_type}")
+            self.logger.debug(f"未知的网格类型: {self.config.grid_type}")
             expected_position = Decimal('0')
 
         return expected_position
@@ -268,10 +268,10 @@ class OrderHealthChecker:
                 # 🔥 持仓数量为None或0时，都视为无持仓
                 # 防止"幽灵持仓"（size=0但有side的情况）
                 if position.size == 0:
-                    self.logger.warning(
+                    self.logger.debug(
                         f"⚠️ 检测到0持仓但有方向({position.side})，视为无持仓")
                 else:
-                    self.logger.warning(f"⚠️ 持仓数量为None，视为无持仓")
+                    self.logger.debug(f"⚠️ 持仓数量为None，视为无持仓")
                 result['actual_position'] = Decimal('0')
                 result['position_side'] = None
             else:
@@ -444,12 +444,12 @@ class OrderHealthChecker:
 
             if action == 'reverse':
                 # 反向持仓：先平仓，再开仓
-                self.logger.warning("⚠️ 检测到持仓方向错误，需要反向调整")
+                self.logger.debug("⚠️ 检测到持仓方向错误，需要反向调整")
 
                 # 🔥 检查实际持仓是否为0（幽灵持仓）
                 actual_position_abs = abs(adjustment_info['actual_position'])
                 if actual_position_abs == 0:
-                    self.logger.warning(
+                    self.logger.debug(
                         "⚠️ 实际持仓为0（可能是幽灵持仓），跳过平仓步骤，直接建仓"
                     )
                 else:
@@ -614,7 +614,7 @@ class OrderHealthChecker:
                 coordinator = self.engine.coordinator
                 if coordinator.scalping_manager and coordinator.scalping_manager.is_active():
                     is_scalping_active = True
-                    self.logger.warning(
+                    self.logger.debug(
                         "🔴 剥头皮模式已激活，健康检查仅执行诊断报告，不执行补单/取消/持仓调整操作")
                     self.logger.debug("💡 原因: 剥头皮模式会自行管理订单和持仓，健康检查不应干预")
 
@@ -629,7 +629,7 @@ class OrderHealthChecker:
                 f"📡 第一次获取: 订单={first_order_count}个, 持仓={len(positions)}个")
 
             if not orders:
-                self.logger.warning("⚠️ 未获取到任何挂单，跳过健康检查")
+                self.logger.debug("⚠️ 未获取到任何挂单，跳过健康检查")
                 return
 
             # 统计订单类型
@@ -671,15 +671,15 @@ class OrderHealthChecker:
             needs_recheck = order_count_abnormal or position_abnormal
 
             if needs_recheck:
-                self.logger.warning("⚠️ 检测到异常，准备进行二次检查")
+                self.logger.debug("⚠️ 检测到异常，准备进行二次检查")
 
                 if order_count_abnormal:
-                    self.logger.warning(
+                    self.logger.debug(
                         f"  - 订单数量异常: 期望{self.config.grid_count}个，实际{first_order_count}个"
                     )
 
                 if position_abnormal:
-                    self.logger.warning(
+                    self.logger.debug(
                         f"  - 持仓异常: {', '.join(position_health['issues'])}")
 
                 # 🔥 二次验证机制：避免竞态条件
@@ -733,18 +733,18 @@ class OrderHealthChecker:
                 else:
                     # 第二次检查仍然异常
                     if order_still_abnormal:
-                        self.logger.warning(
+                        self.logger.debug(
                             f"⚠️ 二次验证: 订单数仍异常({second_order_count}个)"
                         )
                     if position_still_abnormal:
-                        self.logger.warning(
+                        self.logger.debug(
                             f"⚠️ 二次验证: 持仓仍异常 - {', '.join(position_health['issues'])}"
                         )
 
                     # 🔥 第三次验证机制：防止API查询失败误报
                     # 如果订单数=0（买单=0且卖单=0），可能是API临时故障，需要第三次验证
                     if second_order_count == 0 and buy_count == 0 and sell_count == 0:
-                        self.logger.warning(
+                        self.logger.debug(
                             "🔴 二次验证发现订单数为0（买单=0，卖单=0）！\n"
                             "   这可能是API查询失败的误报，而非真实情况\n"
                             "   准备进行第三次验证以确认..."
@@ -764,7 +764,7 @@ class OrderHealthChecker:
                         sell_count = sum(1 for o in orders if o.side ==
                                          ExchangeOrderSide.SELL)
 
-                        self.logger.warning(
+                        self.logger.debug(
                             f"📡 第三次获取: 订单={third_order_count}个, "
                             f"买单={buy_count}个, 卖单={sell_count}个, "
                             f"持仓={len(positions)}个"
@@ -773,7 +773,7 @@ class OrderHealthChecker:
                         # 判断第三次验证结果
                         if third_order_count > 0:
                             # 第三次验证发现有订单，说明二次验证是误报
-                            self.logger.warning(
+                            self.logger.debug(
                                 f"✅ 第三次验证: 订单已恢复（{third_order_count}个）\n"
                                 f"   判定：二次验证时API查询失败，属于误报\n"
                                 f"   系统继续正常运行，不触发紧急停止"
@@ -860,7 +860,7 @@ class OrderHealthChecker:
 
                     elif deviation_percent >= warning_threshold:
                         # 警告级别：输出警告
-                        self.logger.warning(
+                        self.logger.debug(
                             f"⚠️ 剥头皮模式持仓偏差超过警告阈值\n"
                             f"   预期持仓: {expected_pos}\n"
                             f"   实际持仓: {actual_pos}\n"
@@ -891,10 +891,10 @@ class OrderHealthChecker:
             # 注意：此时只记录持仓状态，不立即调整
             # 原因：需要先调整订单，订单稳定后再根据最终订单状态调整持仓
             if position_health['needs_adjustment']:
-                self.logger.warning(
+                self.logger.debug(
                     f"⚠️ 阶段3: 检测到持仓异常，暂不调整（将在订单调整后处理）"
                 )
-                self.logger.warning(
+                self.logger.debug(
                     f"   持仓问题: {', '.join(position_health['issues'])}")
             else:
                 self.logger.debug("✅ 阶段3: 持仓健康（基于当前订单状态）")
@@ -913,7 +913,7 @@ class OrderHealthChecker:
                     f"允许补单"
                 )
             else:
-                self.logger.warning(
+                self.logger.debug(
                     f"🔴 安全检查: 订单数({len(orders)}) >= 网格数({self.config.grid_count}), "
                     f"禁止补单，仅清理问题订单"
                 )
@@ -937,7 +937,7 @@ class OrderHealthChecker:
             if problem_orders['duplicates'] or problem_orders['out_of_range']:
                 if is_scalping_active:
                     # 剥头皮模式激活，只报告问题，不清理
-                    self.logger.warning(
+                    self.logger.debug(
                         f"🔴 检测到问题订单: 重复={len(problem_orders['duplicates'])}个, "
                         f"超范围={len(problem_orders['out_of_range'])}个"
                     )
@@ -962,7 +962,7 @@ class OrderHealthChecker:
             # ==================== 阶段9: 评估网格覆盖 ====================
             self.logger.debug("📊 阶段9: 评估网格覆盖")
 
-            covered_grids, missing_grids, profit_gap_grids = self._evaluate_grid_coverage(
+            covered_grids, missing_grids, profit_gap_grids = await self._evaluate_grid_coverage(
                 orders, theoretical_range
             )
 
@@ -1003,21 +1003,21 @@ class OrderHealthChecker:
                     )
             elif is_scalping_active:
                 # 剥头皮模式激活，只报告缺失，不补单
-                self.logger.warning(
+                self.logger.debug(
                     f"🔴 检测到{len(missing_grids)}个缺失网格"
                 )
                 if len(missing_grids) <= 10:
-                    self.logger.warning(f"   缺失网格: {missing_grids}")
+                    self.logger.debug(f"   缺失网格: {missing_grids}")
                 else:
-                    self.logger.warning(
+                    self.logger.debug(
                         f"   缺失网格: {missing_grids[:5]}...{missing_grids[-5:]} (共{len(missing_grids)}个)"
                     )
                 self.logger.debug("💡 剥头皮模式激活中，跳过补单操作，由剥头皮管理器处理")
             elif not allow_filling:
-                self.logger.warning(
+                self.logger.debug(
                     f"⚠️ 检测到{len(missing_grids)}个真正缺失网格，但订单数已达上限，禁止补单"
                 )
-                self.logger.warning(
+                self.logger.debug(
                     f"💡 建议: 手动检查是否存在异常订单"
                 )
             else:
@@ -1062,7 +1062,7 @@ class OrderHealthChecker:
                             if updated_position_health['is_healthy']:
                                 self.logger.debug("✅ 持仓已调整到位，现在可以补充订单")
                             else:
-                                self.logger.warning(
+                                self.logger.debug(
                                     f"⚠️ 持仓调整后仍有问题: "
                                     f"{', '.join(updated_position_health['issues'])}"
                                 )
@@ -1114,7 +1114,7 @@ class OrderHealthChecker:
                 final_orders) == self.config.grid_count
 
             if not final_order_count_correct:
-                self.logger.warning(
+                self.logger.debug(
                     f"⚠️ 阶段11: 订单数量不正确 "
                     f"(实际{len(final_orders)}个 ≠ 预期{self.config.grid_count}个)，"
                     f"跳过持仓调整"
@@ -1151,14 +1151,14 @@ class OrderHealthChecker:
                     if verify_position_health['is_healthy']:
                         self.logger.debug("✅ 持仓已恢复正常")
                     else:
-                        self.logger.warning(
+                        self.logger.debug(
                             "⚠️ 持仓调整后仍存在问题，可能需要人工介入")
-                        self.logger.warning(
+                        self.logger.debug(
                             f"   剩余问题: {', '.join(verify_position_health['issues'])}")
                 else:
                     self.logger.error("❌ 持仓调整失败")
             elif final_position_health['needs_adjustment'] and is_scalping_active:
-                self.logger.warning(
+                self.logger.debug(
                     f"🔴 检测到持仓异常但剥头皮模式激活，跳过持仓调整: "
                     f"{', '.join(final_position_health['issues'])}"
                 )
@@ -1345,7 +1345,7 @@ class OrderHealthChecker:
             theoretical_range: 理论扩展范围
         """
         if not actual_range['min_grid'] or not actual_range['max_grid']:
-            self.logger.warning("⚠️ 实际范围无效，跳过对比")
+            self.logger.debug("⚠️ 实际范围无效，跳过对比")
             return
 
         actual_min = actual_range['min_grid']
@@ -1370,7 +1370,7 @@ class OrderHealthChecker:
         if actual_min < theory_min:
             below_count = theory_min - actual_min
             issues.append(f"下限超出: {below_count}格低于理论下限")
-            self.logger.warning(
+            self.logger.debug(
                 f"   ⚠️ 订单低于理论下限: Grid {actual_min} < Grid {theory_min} "
                 f"(超出{below_count}格)"
             )
@@ -1378,7 +1378,7 @@ class OrderHealthChecker:
         if actual_max > theory_max:
             above_count = actual_max - theory_max
             issues.append(f"上限超出: {above_count}格高于理论上限")
-            self.logger.warning(
+            self.logger.debug(
                 f"   ⚠️ 订单高于理论上限: Grid {actual_max} > Grid {theory_max} "
                 f"(超出{above_count}格)"
             )
@@ -1386,7 +1386,7 @@ class OrderHealthChecker:
         if not issues:
             self.logger.debug("   ✅ 实际范围在理论范围内，正常")
         else:
-            self.logger.warning(
+            self.logger.debug(
                 f"   ❌ 发现{len(issues)}个范围问题: {', '.join(issues)}")
 
         self.logger.debug("=" * 60)
@@ -1433,13 +1433,13 @@ class OrderHealthChecker:
                 problem_orders['duplicates'].extend(duplicates)
                 duplicate_count += len(duplicates)
 
-                self.logger.warning(
+                self.logger.debug(
                     f"   ❌ 发现重复订单 @${price}: {len(order_list)}个订单, "
                     f"保留{keep_order.id[:10]}..., 标记{len(duplicates)}个为重复"
                 )
 
         if duplicate_count > 0:
-            self.logger.warning(
+            self.logger.debug(
                 f"   🔍 重复订单统计: 共{duplicate_count}个重复订单需要清理"
             )
         else:
@@ -1466,13 +1466,13 @@ class OrderHealthChecker:
             if raw_index < theoretical_range['min_grid'] or raw_index > theoretical_range['max_grid']:
                 problem_orders['out_of_range'].append((order, raw_index))
                 out_of_range_count += 1
-                self.logger.warning(
+                self.logger.debug(
                     f"   ❌ 订单超出理论范围: {order.side.value} @{order.price} "
                     f"(Grid {raw_index}, 理论范围: {theoretical_range['min_grid']}-{theoretical_range['max_grid']})"
                 )
 
         if out_of_range_count > 0:
-            self.logger.warning(
+            self.logger.debug(
                 f"   🔍 超范围订单统计: 共{out_of_range_count}个订单超出理论范围"
             )
         else:
@@ -1525,7 +1525,37 @@ class OrderHealthChecker:
 
         return cleaned_count
 
-    def _evaluate_grid_coverage(
+    async def _get_current_grid_id_from_rest(self) -> Optional[int]:
+        """
+        从REST API获取最新价格，并转换为网格ID
+
+        用于关键决策点（如补单判断），确保使用最新价格
+
+        Returns:
+            网格ID，如果无法获取则返回None
+        """
+        try:
+            # 🔥 通过REST API获取最新价格
+            current_price = await self.engine.get_current_price()
+
+            if current_price is None or current_price <= 0:
+                self.logger.debug(f"⚠️ REST API返回无效价格: {current_price}")
+                return None
+
+            # 使用config将价格转换为网格ID
+            grid_id = self.config.get_grid_index_by_price(current_price)
+
+            self.logger.debug(
+                f"📍 REST查询最新价格: ${current_price}, 所在网格: Grid {grid_id}"
+            )
+
+            return grid_id
+
+        except Exception as e:
+            self.logger.error(f"❌ 从REST API获取当前网格ID失败: {e}")
+            return None
+
+    async def _evaluate_grid_coverage(
         self,
         orders: List,
         extended_range: Dict
@@ -1571,7 +1601,7 @@ class OrderHealthChecker:
                 covered_grids.add(raw_index)
 
             except Exception as e:
-                self.logger.warning(f"⚠️ 订单 @{order.price} 映射失败: {e}")
+                self.logger.debug(f"⚠️ 订单 @{order.price} 映射失败: {e}")
 
         # 如果有异常订单，输出警告
         if anomaly_orders:
@@ -1620,16 +1650,63 @@ class OrderHealthChecker:
                 max_buy_grid = max(buy_grids)
                 min_sell_grid = min(sell_grids)
 
-                # 获利空格 = (max_buy_grid, min_sell_grid) 之间的所有网格
+                # 所有空网格 = (max_buy_grid, min_sell_grid) 之间的所有网格
                 if min_sell_grid > max_buy_grid:
-                    profit_gap_grids = set(
+                    all_empty_grids = set(
                         range(max_buy_grid + 1, min_sell_grid))
 
+                    # 预期获利空网格数量
+                    expected_profit_gap_count = self.config.reverse_order_grid_distance
+
                     self.logger.debug(
-                        f"📍 动态获利空格识别: 买单最高Grid {max_buy_grid}, "
-                        f"卖单最低Grid {min_sell_grid}, "
-                        f"获利空格 {sorted(profit_gap_grids)}"
+                        f"📍 获利空格分析: 买单最高Grid={max_buy_grid}, "
+                        f"卖单最低Grid={min_sell_grid}, "
+                        f"实际空网格={len(all_empty_grids)}个, "
+                        f"预期获利空格={expected_profit_gap_count}个"
                     )
+
+                    # 第一步：判断是否需要补单
+                    if len(all_empty_grids) <= expected_profit_gap_count:
+                        # 空网格数量 <= 预期，说明正常，所有空网格都是合法的获利空格
+                        profit_gap_grids = all_empty_grids
+                        self.logger.debug(
+                            f"   ✅ 空网格数量正常，所有空网格都是获利空格: {sorted(profit_gap_grids)}"
+                        )
+                    else:
+                        # 空网格数量 > 预期，需要判断哪些需要补单
+                        # 🔥 关键决策点：通过REST API获取最新价格，确保判断准确
+                        self.logger.debug(
+                            f"⚠️ 检测到空网格超标({len(all_empty_grids)}个 > {expected_profit_gap_count}个)，"
+                            f"正在通过REST API查询最新价格以准确判断..."
+                        )
+                        current_grid_id = await self._get_current_grid_id_from_rest()
+
+                        if current_grid_id is not None:
+                            # 按距离当前价格的远近排序
+                            empty_grids_sorted = sorted(
+                                all_empty_grids,
+                                key=lambda g: abs(g - current_grid_id)
+                            )
+
+                            # 距离最近的N个空网格是合法的获利空格
+                            profit_gap_grids = set(
+                                empty_grids_sorted[:expected_profit_gap_count])
+
+                            # 需要补单的空网格
+                            grids_need_fill = all_empty_grids - profit_gap_grids
+
+                            self.logger.debug(
+                                f"⚠️ 空网格数量超标: 当前价格Grid={current_grid_id}, "
+                                f"实际空网格={sorted(all_empty_grids)}, "
+                                f"合法获利空格={sorted(profit_gap_grids)}, "
+                                f"需要补单={sorted(grids_need_fill)}"
+                            )
+                        else:
+                            # 无法获取当前价格，保守处理：所有空网格都视为获利空格，不补单
+                            profit_gap_grids = all_empty_grids
+                            self.logger.debug(
+                                f"⚠️ 无法获取当前价格所在网格，暂时将所有空网格视为获利空格，不补单"
+                            )
 
         # 真正的缺失网格（排除获利空格）
         missing_grids = [

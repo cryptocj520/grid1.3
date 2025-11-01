@@ -92,7 +92,10 @@ class GridEngineImpl(IGridEngine):
         self._last_ws_check_time = 0  # 上次检查WebSocket的时间
         self._ws_check_interval = 30  # WebSocket检查间隔（秒）
         self._last_ws_message_time = time.time()  # 上次收到WebSocket消息的时间
-        self._ws_timeout_threshold = 120  # WebSocket超时阈值（秒）
+        # 🔥 WebSocket 心跳超时阈值（秒）- 仅用于 Backpack/Hyperliquid
+        # Lighter 不使用心跳超时检测，只依赖连接状态检测
+        # Backpack/Hyperliquid 会在每次消息时更新心跳，可以用此阈值检测异常
+        self._ws_timeout_threshold = 600  # 10分钟超时阈值
 
         try:
             self.logger.info("🔄 正在订阅WebSocket用户数据流...")
@@ -256,9 +259,24 @@ class GridEngineImpl(IGridEngine):
                 f"({len(batch)}个订单)"
             )
 
-            # 并发下单当前批次
-            tasks = [self.place_order(order) for order in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # 🔥 Lighter交易所特殊处理：串行下单（避免nonce冲突）
+            # 其他交易所：并发下单（保持原有性能）
+            exchange_id = str(self.config.exchange).lower(
+            ) if self.config.exchange else ''
+            if exchange_id == 'lighter':
+                self.logger.info("🔥 Lighter交易所：使用串行下单模式（避免nonce冲突）")
+                results = []
+                for order in batch:
+                    try:
+                        result = await self.place_order(order)
+                        results.append(result)
+                    except Exception as e:
+                        results.append(e)
+                        self.logger.error(f"订单下单异常: {e}")
+            else:
+                # 并发下单当前批次（其他交易所）
+                tasks = [self.place_order(order) for order in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # 统计当前批次结果
             batch_success = 0
@@ -300,9 +318,22 @@ class GridEngineImpl(IGridEngine):
                 retry_orders = [order for order, _ in failed_orders]
                 failed_orders = []  # 清空失败列表
 
-                # 重试失败的订单
-                tasks = [self.place_order(order) for order in retry_orders]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                # 🔥 Lighter交易所：串行重试（避免nonce冲突）
+                # 其他交易所：并发重试
+                exchange_id = str(self.config.exchange).lower(
+                ) if self.config.exchange else ''
+                if exchange_id == 'lighter':
+                    results = []
+                    for order in retry_orders:
+                        try:
+                            result = await self.place_order(order)
+                            results.append(result)
+                        except Exception as e:
+                            results.append(e)
+                else:
+                    # 重试失败的订单（并发）
+                    tasks = [self.place_order(order) for order in retry_orders]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
 
                 retry_success = 0
                 for idx, result in enumerate(results):
@@ -631,41 +662,56 @@ class GridEngineImpl(IGridEngine):
                         self._last_ws_check_time = current_time
                         continue
 
-                    # 🔥 检查WebSocket心跳状态
-                    heartbeat_age = 0
-                    if hasattr(self.exchange, '_last_heartbeat'):
-                        last_heartbeat = self.exchange._last_heartbeat
-                        # 处理可能的datetime对象
-                        if isinstance(last_heartbeat, datetime):
-                            last_heartbeat = last_heartbeat.timestamp()
-                        heartbeat_age = current_time - last_heartbeat
+                    # 🔥 检查WebSocket心跳状态（仅对支持主动心跳的交易所）
+                    exchange_name = self.config.exchange.lower() if hasattr(
+                        self.config, 'exchange') else 'unknown'
 
-                        if heartbeat_age > self._ws_timeout_threshold:
-                            self.logger.error(
-                                f"❌ WebSocket心跳超时（{heartbeat_age:.0f}秒未更新），"
-                                f"切换到REST轮询模式"
-                            )
-                            self.logger.info(
-                                f"📊 最后心跳时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.exchange._last_heartbeat))}")
-                            self.logger.info(
-                                f"📊 最后消息时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self._last_ws_message_time))}")
-                            self.logger.info(
-                                f"📊 当前挂单数量: {len(self._pending_orders)}")
-                            self._ws_monitoring_enabled = False
-                            self._last_ws_check_time = current_time
-                            continue
-
-                    # 🔥 如果连接和心跳都正常，打印健康状态
-                    self.logger.info(
-                        f"💓 WebSocket健康: 连接正常, 心跳 {heartbeat_age:.0f}秒前, "
-                        f"消息 {time_since_last_message:.0f}秒前"
-                    )
-
-                    # 💡 如果长时间没有消息，提示这是正常现象
-                    if time_since_last_message > 300:  # 5分钟
+                    # 🔥 Lighter 不会主动推送心跳消息，只依赖连接状态检测
+                    # Backpack/Hyperliquid 会在每次消息时更新心跳，可以用超时检测
+                    if exchange_name == 'lighter':
+                        # 对于 Lighter：没有订单成交时不会有消息，这是正常现象
+                        # 只要连接状态正常，就继续使用 WebSocket
                         self.logger.info(
-                            f"💡 提示: {time_since_last_message:.0f}秒未收到订单更新 "
-                            f"(无订单成交时的正常现象)"
+                            f"💓 WebSocket健康: 连接正常, "
+                            f"消息 {time_since_last_message:.0f}秒前"
+                        )
+
+                        # 💡 如果长时间没有消息，提示这是正常现象
+                        if time_since_last_message > 600:  # 10分钟
+                            self.logger.info(
+                                f"💡 提示: {time_since_last_message:.0f}秒未收到订单更新 "
+                                f"(无订单成交时的正常现象)"
+                            )
+                    else:
+                        # 对于 Backpack/Hyperliquid：检查心跳超时
+                        heartbeat_age = 0
+                        if hasattr(self.exchange, '_last_heartbeat'):
+                            last_heartbeat = self.exchange._last_heartbeat
+                            # 处理可能的datetime对象
+                            if isinstance(last_heartbeat, datetime):
+                                last_heartbeat = last_heartbeat.timestamp()
+                            heartbeat_age = current_time - last_heartbeat
+
+                            # 对于这些交易所，心跳超时是真正的问题
+                            if heartbeat_age > self._ws_timeout_threshold:
+                                self.logger.error(
+                                    f"❌ WebSocket心跳超时（{heartbeat_age:.0f}秒未更新），"
+                                    f"切换到REST轮询模式"
+                                )
+                                self.logger.info(
+                                    f"📊 最后心跳时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_heartbeat))}")
+                                self.logger.info(
+                                    f"📊 最后消息时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self._last_ws_message_time))}")
+                                self.logger.info(
+                                    f"📊 当前挂单数量: {len(self._pending_orders)}")
+                                self._ws_monitoring_enabled = False
+                                self._last_ws_check_time = current_time
+                                continue
+
+                        # 打印健康状态
+                        self.logger.info(
+                            f"💓 WebSocket健康: 连接正常, 心跳 {heartbeat_age:.0f}秒前, "
+                            f"消息 {time_since_last_message:.0f}秒前"
                         )
 
                     continue
@@ -726,6 +772,17 @@ class GridEngineImpl(IGridEngine):
             # 获取所有挂单
             open_orders = await self.exchange.get_open_orders(self.config.symbol)
 
+            # 🔍 调试：输出查询结果
+            self.logger.info(
+                f"🔍 批量下单后查询挂单: 共查询到 {len(open_orders) if open_orders else 0} 个挂单")
+            if open_orders:
+                rest_order_ids = [o.id for o in open_orders]
+                self.logger.info(f"🔍 REST返回的挂单ID: {rest_order_ids}")
+
+            # 🔍 调试：输出本地订单ID
+            pending_ids = list(self._pending_orders.keys())
+            self.logger.info(f"🔍 本地_pending_orders的ID: {pending_ids}")
+
             if not open_orders:
                 self.logger.warning("⚠️ 未获取到任何挂单，可能所有订单都已成交")
                 # 所有订单都可能已成交，逐个检查
@@ -753,19 +810,29 @@ class GridEngineImpl(IGridEngine):
                                 self.logger.error(f"订单回调执行失败: {e}")
                 return
 
-            # 创建挂单ID集合
-            # OrderData使用'id'属性，不是'order_id'
+            # 创建挂单ID集合（同时包含 order.id 和 order.client_id）
+            # OrderData使用'id'属性（order_index）和'client_id'属性（client_order_id）
             open_order_ids = {order.id for order in open_orders if order.id}
+            open_client_ids = {
+                order.client_id for order in open_orders if order.client_id}
+
+            self.logger.debug(f"🔍 挂单 order_index 集合: {open_order_ids}")
+            self.logger.debug(f"🔍 挂单 client_id 集合: {open_client_ids}")
 
             # 检查哪些订单不在挂单列表中（可能已成交）
+            # 同时检查 order_id 和 client_id，只要其中一个匹配就认为订单还在挂单列表中
             filled_count = 0
             pending_order_ids = list(self._pending_orders.keys())
 
             for order_id in pending_order_ids:
-                if order_id not in open_order_ids:
+                # 如果 order_id 既不在 open_order_ids 也不在 open_client_ids 中，才认为已成交
+                if order_id not in open_order_ids and order_id not in open_client_ids:
                     order = self._pending_orders.get(order_id)
                     if order:
                         filled_count += 1
+                        self.logger.info(
+                            f"🔍 订单ID {order_id} 不在REST挂单列表中 (REST返回{len(open_order_ids)}个order_index, {len(open_client_ids)}个client_id)"
+                        )
                         self.logger.info(
                             f"✅ 检测到立即成交订单: {order.side.value} {order.amount}@{order.price} "
                             f"(Grid {order.grid_id}, OrderID: {order_id})"
@@ -787,6 +854,11 @@ class GridEngineImpl(IGridEngine):
                                 self.logger.error(f"❌ 订单回调执行失败: {e}")
                                 import traceback
                                 self.logger.error(traceback.format_exc())
+                else:
+                    # 🔍 订单匹配成功（在挂单列表中）
+                    self.logger.debug(
+                        f"✅ 订单ID {order_id} 在挂单列表中（匹配成功）"
+                    )
 
             if filled_count > 0:
                 self.logger.info(
@@ -867,36 +939,13 @@ class GridEngineImpl(IGridEngine):
         }
         """
         try:
-            # 🔍 DEBUG: 方法入口 - 打印基本信息
-            timestamp = time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-            print(
-                f"\n[ENGINE-ORDER-UPDATE] 🔔 [{timestamp}] _on_order_update 被调用！", flush=True)
-            print(
-                f"[ENGINE-ORDER-UPDATE] 数据类型: {type(update_data)}", flush=True)
-            print(
-                f"[ENGINE-ORDER-UPDATE] 数据长度: {len(update_data) if isinstance(update_data, (list, dict)) else 'N/A'}", flush=True)
-
-            # 🔍 打印完整的原始数据
-            if isinstance(update_data, list):
-                print(
-                    f"[ENGINE-ORDER-UPDATE] 这是一个列表，包含 {len(update_data)} 个元素", flush=True)
-                for idx, item in enumerate(update_data[:3]):  # 只打印前3个
-                    print(
-                        f"[ENGINE-ORDER-UPDATE] 元素[{idx}]类型={type(item)}, 内容={item if not isinstance(item, dict) else {k:v for k,v in list(item.items())[:5]}}", flush=True)
-            elif isinstance(update_data, dict):
-                print(
-                    f"[ENGINE-ORDER-UPDATE] 这是一个字典，键={list(update_data.keys())}", flush=True)
-                print(
-                    f"[ENGINE-ORDER-UPDATE] 字典内容（前5个键）: {dict(list(update_data.items())[:5])}", flush=True)
-            else:
-                print(f"[ENGINE-ORDER-UPDATE] 数据内容: {update_data}", flush=True)
+            # 🔍 简化日志：仅记录关键信息到日志文件
+            self.logger.debug(
+                f"📨 收到WebSocket订单更新，类型={type(update_data).__name__}")
 
             # 🔥 更新WebSocket消息时间戳（表示WebSocket正常工作）
             self._last_ws_message_time = time.time()
 
-            # 添加调试日志
-            self.logger.info(
-                f"[WS-CALLBACK-DEBUG] 📨 收到WebSocket订单更新回调，数据类型={type(update_data)}")
             self.logger.debug(f"📨 完整订单更新数据: {update_data}")
             self.logger.debug(
                 f"📊 WebSocket消息时间戳已更新: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self._last_ws_message_time))}")
@@ -904,37 +953,46 @@ class GridEngineImpl(IGridEngine):
             # 🔥 检测数据格式：Hyperliquid OrderData对象 vs Backpack字典
             from ....adapters.exchanges.models import OrderData as ExchangeOrderData
 
-            # === Hyperliquid: OrderData对象 ===
+            # === Hyperliquid/Lighter: OrderData对象 ===
             if isinstance(update_data, ExchangeOrderData):
-                print(f"[ENGINE-DEBUG] 收到Hyperliquid OrderData对象", flush=True)
-                print(
-                    f"[ENGINE-DEBUG] OrderID: {update_data.order_id}, Status: {update_data.status}", flush=True)
+                self.logger.debug(
+                    f"收到OrderData: id={update_data.id}, client_id={update_data.client_id}, status={update_data.status}")
 
-                order_id = str(update_data.order_id)
-                status = update_data.status.upper() if update_data.status else ""
+                order_id = str(update_data.id)
+                client_id = str(
+                    update_data.client_id) if update_data.client_id else None
+                # 🔥 修复：OrderStatus是枚举，使用.value获取字符串值
+                status = update_data.status.value.upper() if update_data.status else ""
                 event_type = "order_update"
 
-                # 检查是否是我们的订单
-                if order_id not in self._pending_orders:
-                    self.logger.debug(f"收到非监控订单的更新: {order_id}")
+                # 🔥 修复：优先用 client_id 匹配订单（因为下单时返回的是 tx_hash，不是 order_index）
+                grid_order = None
+                if client_id and client_id in self._pending_orders:
+                    grid_order = self._pending_orders[client_id]
+                    self.logger.debug(
+                        f"✅ 通过ClientID找到订单: {client_id}, Grid={grid_order.grid_id}")
+                elif order_id in self._pending_orders:
+                    grid_order = self._pending_orders[order_id]
+                    self.logger.debug(
+                        f"✅ 通过OrderID找到订单: {order_id}, Grid={grid_order.grid_id}")
+                else:
+                    self.logger.debug(
+                        f"收到非监控订单的更新: OrderID={order_id}, ClientID={client_id}")
                     return
 
-                grid_order = self._pending_orders[order_id]
-                print(
-                    f"[ENGINE-DEBUG] ✅ 找到订单！Grid={grid_order.grid_id}, Side={grid_order.side}", flush=True)
-
-                # Hyperliquid的订单状态
+                # Hyperliquid/Lighter的订单状态
                 if status in ["FILLED", "CLOSED"]:
-                    print(f"[ENGINE-DEBUG] ✅ Hyperliquid订单已成交！", flush=True)
-
-                    filled_price = update_data.average_price or update_data.price or grid_order.price
-                    filled_amount = update_data.filled_amount or grid_order.amount
-
-                    print(
-                        f"[ENGINE-DEBUG] 成交价格={filled_price}, 成交数量={filled_amount}", flush=True)
+                    # 🔥 修复：OrderData的属性名是 average 和 filled，不是 average_price 和 filled_amount
+                    filled_price = update_data.average or update_data.price or grid_order.price
+                    filled_amount = update_data.filled or grid_order.amount
 
                     grid_order.mark_filled(filled_price, filled_amount)
-                    del self._pending_orders[order_id]
+
+                    # 🔥 修复：从字典中删除订单时，使用实际存储的key（client_id或order_id）
+                    if client_id and client_id in self._pending_orders:
+                        del self._pending_orders[client_id]
+                    elif order_id in self._pending_orders:
+                        del self._pending_orders[order_id]
 
                     self.logger.info(
                         f"✅ WebSocket订单成交: {grid_order.side.value} {filled_amount}@{filled_price} "
@@ -942,8 +1000,6 @@ class GridEngineImpl(IGridEngine):
                     )
 
                     # 触发回调（重要！）
-                    print(
-                        f"[ENGINE-DEBUG] 触发 {len(self._order_callbacks)} 个回调", flush=True)
                     for callback in self._order_callbacks:
                         try:
                             if asyncio.iscoroutinefunction(callback):
@@ -953,12 +1009,10 @@ class GridEngineImpl(IGridEngine):
                         except Exception as e:
                             self.logger.error(f"订单回调执行失败: {e}")
 
-                    print(f"[ENGINE-DEBUG] Hyperliquid订单成交处理完成\n", flush=True)
                     return
 
                 elif status in ["CANCELLED", "CANCELED"]:
-                    print(
-                        f"[ENGINE-DEBUG] ✅ Hyperliquid订单被取消！order_id={order_id}", flush=True)
+                    self.logger.debug(f"订单被取消: order_id={order_id}")
 
                     if order_id in self._pending_orders:
                         del self._pending_orders[order_id]
@@ -975,10 +1029,15 @@ class GridEngineImpl(IGridEngine):
 
                     return
 
+                else:
+                    # 🔥 其他状态（如 OPEN, PENDING）：订单挂单成功的通知，无需处理
+                    self.logger.debug(
+                        f"订单状态更新: {status}, Grid {grid_order.grid_id}")
+                    return
+
             # === Hyperliquid: 列表格式（订单列表更新）===
             if isinstance(update_data, list):
-                print(
-                    f"\n[WS-ORDER] 收到Hyperliquid订单列表，包含{len(update_data)}个订单", flush=True)
+                self.logger.debug(f"收到Hyperliquid订单列表，包含{len(update_data)}个订单")
 
                 # 🔥 遍历处理每个订单（实现实时WebSocket监控）
                 processed_count = 0
@@ -996,8 +1055,6 @@ class GridEngineImpl(IGridEngine):
 
                         # 处理订单成交
                         if status in ['closed', 'filled']:
-                            print(
-                                f"[WS-ORDER] ✅ 订单成交！OrderID={order_id}, Grid {grid_order.grid_id}", flush=True)
 
                             filled_price = Decimal(
                                 str(order_item.get('price', grid_order.price)))
@@ -1026,8 +1083,7 @@ class GridEngineImpl(IGridEngine):
                             processed_count += 1
 
                 if processed_count > 0:
-                    print(
-                        f"[WS-ORDER] ✅ 处理了{processed_count}个订单成交，已触发反向挂单\n", flush=True)
+                    self.logger.debug(f"处理了{processed_count}个订单成交")
 
                 return
 
@@ -1036,9 +1092,8 @@ class GridEngineImpl(IGridEngine):
                 self.logger.warning(f"未知的订单更新格式: {type(update_data)}")
                 return
 
-            print(f"[ENGINE-DEBUG] 使用Backpack格式处理", flush=True)
+            self.logger.debug("使用Backpack格式处理")
             data = update_data.get('data', update_data)
-            print(f"[ENGINE-DEBUG] data字段内容: {data}", flush=True)
 
             # 如果data仍然不是字典，跳过
             if not isinstance(data, dict):
@@ -1050,27 +1105,16 @@ class GridEngineImpl(IGridEngine):
             status = data.get('X')     # Backpack使用'X'表示状态
             event_type = data.get('e')  # 事件类型
 
-            print(
-                f"[ENGINE-DEBUG] 提取字段: order_id={order_id}, status={status}, event_type={event_type}", flush=True)
-
             if not order_id:
-                print(f"[ENGINE-DEBUG] ❌ 订单ID为空，跳过处理", flush=True)
                 self.logger.debug(f"订单更新缺少订单ID: {update_data}")
                 return
 
             # 检查是否是我们的订单
-            print(f"[ENGINE-DEBUG] 检查订单是否在监控列表...", flush=True)
-            print(
-                f"[ENGINE-DEBUG] 当前监控订单数量: {len(self._pending_orders)}", flush=True)
-
             if order_id not in self._pending_orders:
-                print(f"[ENGINE-DEBUG] ❌ 订单{order_id}不在监控列表中，跳过", flush=True)
                 self.logger.debug(f"收到非监控订单的更新: {order_id}")
                 return
 
             grid_order = self._pending_orders[order_id]
-            print(
-                f"[ENGINE-DEBUG] ✅ 找到订单！Grid={grid_order.grid_id}, Side={grid_order.side}", flush=True)
 
             self.logger.info(
                 f"📨 订单更新: ID={order_id}, "
@@ -1079,15 +1123,11 @@ class GridEngineImpl(IGridEngine):
             )
 
             # ✅ 修复：Backpack使用"Filled"表示已成交
-            print(f"[ENGINE-DEBUG] 判断订单状态...", flush=True)
             if status == 'Filled' or event_type == 'orderFilled':
-                print(f"[ENGINE-DEBUG] ✅ 订单已成交！", flush=True)
                 # 获取成交价格和数量 - 从data字段中提取
                 filled_price = Decimal(str(data.get('p', grid_order.price)))
                 filled_amount = Decimal(
                     str(data.get('z', grid_order.amount)))  # 'z'是已成交数量
-                print(
-                    f"[ENGINE-DEBUG] 成交价格={filled_price}, 成交数量={filled_amount}", flush=True)
 
                 grid_order.mark_filled(filled_price, filled_amount)
 
@@ -1111,20 +1151,12 @@ class GridEngineImpl(IGridEngine):
 
             # 🔥 处理订单取消事件
             elif status == 'Cancelled' or event_type == 'orderCancelled':
-                print(
-                    f"[ENGINE-DEBUG] ✅ 订单被取消！order_id={order_id}", flush=True)
-
                 # 从挂单列表移除
                 if order_id in self._pending_orders:
                     del self._pending_orders[order_id]
-                    print(f"[ENGINE-DEBUG] 已从挂单列表移除", flush=True)
 
                 # 🔥 关键修复：区分主动取消和被动取消
                 is_expected_cancellation = order_id in self._expected_cancellations
-                print(
-                    f"[ENGINE-DEBUG] 是否为预期取消: {is_expected_cancellation}", flush=True)
-                print(
-                    f"[ENGINE-DEBUG] 预期取消列表长度: {len(self._expected_cancellations)}", flush=True)
 
                 if is_expected_cancellation:
                     # 主动取消（剥头皮模式、本金保护等），不重新挂单
@@ -1170,9 +1202,7 @@ class GridEngineImpl(IGridEngine):
                         )
 
         except Exception as e:
-            print(f"\n[ENGINE-DEBUG] ❌ 异常！{e}", flush=True)
             import traceback
-            print(f"[ENGINE-DEBUG] 堆栈:\n{traceback.format_exc()}", flush=True)
             self.logger.error(f"处理订单更新失败: {e}")
             self.logger.error(traceback.format_exc())
 
@@ -1258,11 +1288,8 @@ class GridEngineImpl(IGridEngine):
             self._current_price = price
             self._last_price_update_time = time.time()
 
-            # 可选：记录价格更新（调试用）
-            # self.logger.debug(f"💹 价格更新: {price}")
-
         except Exception as e:
-            self.logger.error(f"处理价格更新失败: {e}")
+            self.logger.error(f"处理价格更新失败: {e}", exc_info=True)
 
     def get_price_monitor_mode(self) -> str:
         """

@@ -64,6 +64,13 @@ class GridConfig:
     # - SOL: 4位小数 (0.0001)
     # 💡 查看方法：在交易所下单界面查看最小下单单位
 
+    price_decimals: int = 2                  # 价格精度（小数位数，默认2位，如USD）
+    # 说明：不同交易所和交易对的价格精度不同
+    # - Backpack BTC/USD: 2位小数 ($110,000.50)
+    # - Lighter BTC: 1位小数 ($110,000.5)
+    # - Hyperliquid BTC: 1位小数 ($110,000.5)
+    # 💡 查看方法：在交易所订单簿中查看价格显示格式
+
     # 马丁网格参数（可选）
     martingale_increment: Optional[Decimal] = None  # 马丁网格递增金额（None表示不启用马丁模式）
 
@@ -315,7 +322,7 @@ class GridConfig:
                 # 使用阈值作为上限
                 base_price = self.price_lock_threshold
                 self.logger.info(
-                    f"🔒 做多网格: 当前价格${current_price:,.2f}高于阈值${self.price_lock_threshold:,.2f}，"
+                    f"🔒 做多网格: 当前价格${current_price:,.{self.price_decimals}f}高于阈值${self.price_lock_threshold:,.{self.price_decimals}f}，"
                     f"根据配置使用阈值作为网格起点"
                 )
             else:
@@ -329,7 +336,7 @@ class GridConfig:
                 self.logger.info(
                     f"📊 做多网格: 应用价格偏移 +{self.price_offset_grids}格 "
                     f"(${offset_amount:,.4f}), "
-                    f"上边界 ${base_price:,.2f} → ${self.upper_price:,.2f}"
+                    f"上边界 ${base_price:,.{self.price_decimals}f} → ${self.upper_price:,.{self.price_decimals}f}"
                 )
             else:
                 self.upper_price = base_price
@@ -346,7 +353,7 @@ class GridConfig:
                 # 使用阈值作为下限
                 base_price = self.price_lock_threshold
                 self.logger.info(
-                    f"🔒 做空网格: 当前价格${current_price:,.2f}低于阈值${self.price_lock_threshold:,.2f}，"
+                    f"🔒 做空网格: 当前价格${current_price:,.{self.price_decimals}f}低于阈值${self.price_lock_threshold:,.{self.price_decimals}f}，"
                     f"根据配置使用阈值作为网格起点"
                 )
             else:
@@ -360,7 +367,7 @@ class GridConfig:
                 self.logger.info(
                     f"📊 做空网格: 应用价格偏移 -{self.price_offset_grids}格 "
                     f"(${offset_amount:,.4f}), "
-                    f"下边界 ${base_price:,.2f} → ${self.lower_price:,.2f}"
+                    f"下边界 ${base_price:,.{self.price_decimals}f} → ${self.lower_price:,.{self.price_decimals}f}"
                 )
             else:
                 self.lower_price = base_price
