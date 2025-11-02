@@ -93,6 +93,20 @@ class VolumeMakerTerminalUI:
             "当前轮次", f"{stats.current_cycle} / {self.service.config.max_cycles}")
         table.add_row("连续失败", str(stats.consecutive_fails))
 
+        # 🔥 显示余额（如果有）
+        if hasattr(self.service, '_latest_balance') and self.service._latest_balance is not None:
+            balance_currency = getattr(
+                self.service, '_balance_currency', 'USDC')
+            balance_value = self.service._latest_balance
+            # 余额颜色：大于min_balance用绿色，否则黄色
+            if hasattr(self.service.config, 'min_balance') and self.service.config.min_balance:
+                balance_color = "green" if balance_value >= Decimal(
+                    str(self.service.config.min_balance)) else "yellow"
+            else:
+                balance_color = "green"
+            table.add_row(
+                "余额", f"{balance_value:.2f} {balance_currency}", style=f"bold {balance_color}")
+
         # 🔥 显示反向交易模式状态
         if hasattr(self.service.config, 'reverse_trading') and self.service.config.reverse_trading:
             table.add_row("交易模式", "🔄 反向", style="bold magenta")

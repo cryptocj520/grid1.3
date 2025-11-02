@@ -77,6 +77,10 @@ class VolumeMakerConfig:
     market_price_change_count: int = 1  # 市价模式：价格变化多少次后触发平仓（默认1次）
     market_wait_timeout: float = 30.0  # 市价模式：等待价格变化的最大超时时间（秒，默认30秒）
 
+    # Lighter 链上交易配置
+    chain_confirmation_wait: int = 30  # 链上交易确认等待时间（秒）
+    websocket_fill_timeout: int = 15  # WebSocket成交确认超时时间（秒）
+
     # 成交价格获取方式
     # 成交价格获取方式: "rest"(REST API查询) 或 "websocket"(WebSocket订阅)
     fill_price_method: str = "rest"
@@ -142,6 +146,10 @@ class VolumeMakerConfig:
                 'market_price_change_count', 1),
             market_wait_timeout=float(vm_data.get(
                 'market_wait_timeout', 30.0)),
+            chain_confirmation_wait=vm_data.get(
+                'chain_confirmation_wait', 30),
+            websocket_fill_timeout=vm_data.get(
+                'websocket_fill_timeout', 15),
             fill_price_method=vm_data.get(
                 'fill_price_method', 'rest'),
             orderbook_method=vm_data.get(

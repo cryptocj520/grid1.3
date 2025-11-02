@@ -9,23 +9,23 @@ Lighter交易所适配器 - REST API模块
    - market_id=0: ETH
    - market_id=1: BTC
    - market_id=2: SOL
-   
+
 2. 动态价格精度（关键特性）：
    - 不同交易对使用不同的价格精度
    - 价格乘数公式: price_int = price_usd × (10 ** price_decimals)
    - 数量使用1e5: base_amount = quantity × 100000 (实际测试确认)
-   
+
    示例：
    - ETH (2位小数): $4127.39 × 100 = 412739
    - BTC (1位小数): $114357.8 × 10 = 1143578
    - SOL (3位小数): $199.058 × 1000 = 199058
    - DOGE (6位小数): $0.202095 × 1000000 = 202095
-   
+
 3. 必须使用order_books() API：
    - 获取完整市场列表必须用order_books()
    - order_book_details(market_id) 只返回活跃市场
    - 不能通过循环遍历market_id来发现市场
-   
+
 这些设计是Lighter作为Layer 2 DEX的优化选择，与传统CEX不同！
 """
 
@@ -1034,6 +1034,8 @@ class LighterRest(LighterBase):
         quantity: Decimal,
         provided_price: Optional[Decimal],
         market_info: Dict,
+        batch_mode: bool = False,
+        skip_order_index_query: bool = False,
         **kwargs
     ) -> Optional[OrderData]:
         """执行市价单"""
@@ -1061,7 +1063,8 @@ class LighterRest(LighterBase):
             # 处理结果
             return await self._handle_order_result(
                 tx, tx_hash, err, symbol, side, "market",
-                quantity, avg_execution_price, **kwargs
+                quantity, avg_execution_price, batch_mode=batch_mode,
+                skip_order_index_query=skip_order_index_query, **kwargs
             )
         except Exception as e:
             logger.error(f"执行市价单失败: {e}")
@@ -1074,6 +1077,8 @@ class LighterRest(LighterBase):
         quantity: Decimal,
         price: Optional[Decimal],
         market_info: Dict,
+        batch_mode: bool = False,
+        skip_order_index_query: bool = False,
         **kwargs
     ) -> Optional[OrderData]:
         """执行限价单"""
@@ -1107,7 +1112,8 @@ class LighterRest(LighterBase):
 
             return await self._handle_order_result(
                 tx, tx_hash, err, symbol, side, "limit",
-                quantity, price_rounded, **kwargs
+                quantity, price_rounded, batch_mode=batch_mode,
+                skip_order_index_query=skip_order_index_query, **kwargs
             )
         except Exception as e:
             logger.error(f"执行限价单失败: {e}")
@@ -1123,6 +1129,8 @@ class LighterRest(LighterBase):
         order_type: str,
         quantity: Decimal,
         price: Decimal,
+        batch_mode: bool = False,
+        skip_order_index_query: bool = False,
         **kwargs
     ) -> Optional[OrderData]:
         """
@@ -1130,6 +1138,9 @@ class LighterRest(LighterBase):
 
         ⚠️ 重要：Lighter下单API返回的是transaction hash，不是order_id
         真正的order_id需要从WebSocket推送或REST查询中获取
+
+        Args:
+            batch_mode: 批量下单模式，True时不立即查询order_index
         """
         # 检查错误
         if err:
@@ -1167,23 +1178,74 @@ class LighterRest(LighterBase):
         logger.info(f"   tx_hash: {tx_hash_str}")
         logger.info(f"   将通过WebSocket回调获取order_id和订单状态")
 
-        # 🔥 Lighter特殊处理：使用 client_order_id 作为订单ID
-        # 原因：
-        # 1. 下单返回的是 tx_hash（128字符），无法直接查询订单
-        # 2. WebSocket 推送包含 client_order_index，可以用它匹配订单
-        # 3. 引擎用 client_order_id 存储订单，WebSocket 推送时通过 client_order_index 匹配
+        # 🔥 Lighter专属：订单ID获取策略
+        #
+        # 批量模式（batch_mode=True）：
+        # - 不立即查询 order_index（避免API频率限制）
+        # - 使用 client_order_id 作为临时ID
+        # - 依赖批量同步建立 order_index 映射
+        #
+        # 跳过查询模式（skip_order_index_query=True）：
+        # - Volume Maker 刷量程序使用
+        # - 市价单立即成交，查询必然失败且浪费资源
+        # - 使用状态机匹配（基于方向+数量，不依赖 order_id）
+        #
+        # 单个模式（batch_mode=False, skip_order_index_query=False，默认）：
+        # - 网格程序使用
+        # - 立即查询 order_index（确保反手单可靠性）
+        # - 直接使用 order_index 作为唯一标识
         from datetime import datetime
 
-        client_order_id_str = str(kwargs.get("client_order_id", int(
-            asyncio.get_event_loop().time() * 1000)))
+        if batch_mode:
+            # 批量模式：使用 client_order_id
+            client_order_id_str = str(kwargs.get("client_order_id", int(
+                asyncio.get_event_loop().time() * 1000)))
+            order_id = client_order_id_str
+            logger.info(
+                f"📦 批量模式：使用 client_order_id={order_id}，"
+                f"稍后批量同步 order_index"
+            )
+        elif skip_order_index_query:
+            # 跳过查询模式：直接使用临时ID（Volume Maker 刷量程序）
+            client_order_id_str = str(kwargs.get("client_order_id", int(
+                asyncio.get_event_loop().time() * 1000)))
+            order_id = client_order_id_str
+            logger.debug(
+                f"🔖 跳过查询模式：使用临时ID={order_id}，"
+                f"依赖状态机匹配"
+            )
+        else:
+            # 单个模式：立即查询 order_index（网格程序）
+            logger.info(f"🔍 单个模式：立即查询 order_index...")
 
-        logger.info(
-            f"🔑 Lighter订单标识: client_order_id={client_order_id_str}, tx_hash={tx_hash_str[:16]}...")
+            order_index = await self._query_order_index(
+                symbol=symbol,
+                side=side,
+                price=price,
+                amount=quantity,
+                max_retries=3
+            )
+
+            if order_index:
+                # ✅ 成功获取 order_index
+                order_id = str(order_index)
+                logger.info(
+                    f"✅ 使用 order_index 作为订单ID: {order_id}"
+                )
+            else:
+                # ⚠️ 查询失败，降级使用 client_order_id
+                client_order_id_str = str(kwargs.get("client_order_id", int(
+                    asyncio.get_event_loop().time() * 1000)))
+                order_id = client_order_id_str
+                logger.warning(
+                    f"⚠️ 降级使用 client_order_id: {order_id}，"
+                    f"tx_hash={tx_hash_str[:16]}..."
+                )
 
         return OrderData(
-            # 🔥 使用 client_order_id（而不是 tx_hash）
-            id=client_order_id_str,
-            client_id=client_order_id_str,                       # 保持一致
+            # 🔥 id 和 client_id 使用相同的值（order_index 或 client_order_id）
+            id=order_id,
+            client_id=order_id,  # 统一标识，消除双键问题
             symbol=symbol,
             side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL,
             type=OrderType.MARKET if order_type == "market" else OrderType.LIMIT,
@@ -1202,6 +1264,90 @@ class LighterRest(LighterBase):
             raw_data={'tx': tx, 'tx_hash': tx_hash, 'tx_hash_str': tx_hash_str}
         )
 
+    async def _query_order_index(
+        self,
+        symbol: str,
+        side: str,
+        price: Decimal,
+        amount: Decimal,
+        max_retries: int = 3,
+        retry_delay: float = 0.5
+    ) -> Optional[str]:
+        """
+        通过价格和数量匹配查询 order_index
+
+        🔥 Lighter专属：解决下单后无法立即获得 order_index 的问题
+
+        背景：
+        - Lighter 下单返回 tx_hash，不是 order_index
+        - order_index 需要等待区块确认后才生成
+        - 我们需要立即获取 order_index 以避免 WebSocket 匹配失败
+
+        Args:
+            symbol: 交易对符号
+            side: 订单方向 ("buy" 或 "sell")
+            price: 订单价格
+            amount: 订单数量
+            max_retries: 最大重试次数（默认3次）
+            retry_delay: 重试延迟（秒，默认0.5秒）
+
+        Returns:
+            order_index (字符串) 或 None（查询失败）
+        """
+        for attempt in range(max_retries):
+            try:
+                # 首次查询前稍微等待，让订单上链
+                if attempt == 0:
+                    await asyncio.sleep(0.3)  # 首次等待300ms
+                elif attempt > 0:
+                    await asyncio.sleep(retry_delay * attempt)  # 递增延迟
+
+                # 查询挂单列表
+                open_orders = await self.get_open_orders(symbol)
+
+                if not open_orders:
+                    logger.debug(
+                        f"🔍 尝试 {attempt+1}/{max_retries}: "
+                        f"暂无挂单（订单可能还在上链）"
+                    )
+                    continue
+
+                # 精确匹配：价格 + 数量
+                for order in open_orders:
+                    # 价格匹配（容差 0.01 USD）
+                    price_match = abs(float(order.price) - float(price)) < 0.01
+                    # 数量匹配（容差 0.00001）
+                    amount_match = abs(float(order.amount) -
+                                       float(amount)) < 0.00001
+                    # 方向匹配
+                    side_str = "BUY" if side.lower() == "buy" else "SELL"
+                    side_match = order.side.name == side_str
+
+                    if price_match and amount_match and side_match:
+                        logger.info(
+                            f"✅ 查询到 order_index: {order.id} "
+                            f"({side} {amount}@{price})"
+                        )
+                        return order.id
+
+                logger.debug(
+                    f"🔍 尝试 {attempt+1}/{max_retries}: "
+                    f"未找到匹配订单 ({side} {amount}@{price}，"
+                    f"当前挂单数: {len(open_orders)})"
+                )
+
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ 查询订单失败 (尝试 {attempt+1}/{max_retries}): {e}"
+                )
+
+        # 所有重试都失败
+        logger.warning(
+            f"❌ 无法获取 order_index ({side} {amount}@{price})，"
+            f"已重试 {max_retries} 次。将依赖健康检查兜底。"
+        )
+        return None
+
     async def place_order(
         self,
         symbol: str,
@@ -1209,6 +1355,8 @@ class LighterRest(LighterBase):
         order_type: str,
         quantity: Decimal,
         price: Optional[Decimal] = None,
+        batch_mode: bool = False,
+        skip_order_index_query: bool = False,
         **kwargs
     ) -> Optional[OrderData]:
         """
@@ -1259,11 +1407,13 @@ class LighterRest(LighterBase):
             # 3. 根据订单类型执行下单
             if order_type.lower() == "market":
                 return await self._execute_market_order(
-                    symbol, side, quantity, price, market_info, **kwargs
+                    symbol, side, quantity, price, market_info, batch_mode=batch_mode,
+                    skip_order_index_query=skip_order_index_query, **kwargs
                 )
             else:
                 return await self._execute_limit_order(
-                    symbol, side, quantity, price, market_info, **kwargs
+                    symbol, side, quantity, price, market_info, batch_mode=batch_mode,
+                    skip_order_index_query=skip_order_index_query, **kwargs
                 )
 
         except Exception as e:
@@ -1329,7 +1479,8 @@ class LighterRest(LighterBase):
             symbol: str,
             side: OrderSide,
             quantity: Decimal,
-            reduce_only: bool = False) -> Optional[OrderData]:
+            reduce_only: bool = False,
+            skip_order_index_query: bool = False) -> Optional[OrderData]:
         """
         下市价单（便捷方法）
 
@@ -1338,6 +1489,7 @@ class LighterRest(LighterBase):
             side: 订单方向
             quantity: 数量
             reduce_only: 只减仓模式（平仓专用，不会开新仓或加仓）
+            skip_order_index_query: 跳过 order_index 查询（Volume Maker 使用）
 
         Returns:
             订单数据 或 None
@@ -1355,7 +1507,8 @@ class LighterRest(LighterBase):
             side=side_str,  # 🔥 修复：传递字符串而不是枚举
             order_type="market",  # 🔥 修复：传递字符串
             quantity=quantity,
-            reduce_only=reduce_only  # 🔥 新增：只减仓模式
+            reduce_only=reduce_only,  # 🔥 新增：只减仓模式
+            skip_order_index_query=skip_order_index_query
         )
 
     # ============= 辅助方法 =============

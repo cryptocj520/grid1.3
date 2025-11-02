@@ -3,6 +3,54 @@
 
 负责与交易所适配器交互，执行订单操作
 复用现有的交易所适配器系统
+
+🔥 重要修复说明（2025-11-02）：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+问题 1：Lighter 反手单无法触发二次反手单
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【问题根源】
+Lighter 作为链上交易所，订单有两种 ID：
+1. client_order_id: 程序生成的小数字（如 1397817），下单时使用
+2. order_index: Lighter 链上分配的大数字（如 844424452467788），WebSocket 推送时使用
+
+【问题流程】
+1. 初始300个订单：批量下单后，健康检查（60秒后）同步了 order_index ✅
+2. 反手单：单个下单后，没有立即同步 order_index ❌
+3. 如果反手单在下次健康检查（180秒间隔）前成交：
+   - WebSocket 推送的是 order_index（大数字）
+   - _pending_orders 中只有 client_order_id（小数字）
+   - 无法匹配 → 无法触发二次反手单 ❌
+
+【解决方案 1】
+新增 sync_single_order_id() 方法：
+- 在每次单个反手单下单后立即调用
+- 通过 REST API 查询该订单的 order_index
+- 将 order_index 添加到 _pending_orders（与 client_order_id 指向同一对象）
+- 确保 WebSocket 成交时能够匹配
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+问题 2：订单统计重复（"订单同步后仍有差异"警告）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【问题根源】
+由于同一订单有两个键，_pending_orders 结构为：
+{
+    "1397817": GridOrder(...),           # client_order_id
+    "844424452467788": GridOrder(...)    # order_index（指向同一对象）
+}
+
+原 get_pending_orders() 返回 list(self._pending_orders.values())，
+会统计两次同一个对象，导致订单数量虚高。
+
+【解决方案 2】
+修复 get_pending_orders() 方法，按对象内存地址去重：
+- 使用 id(order) 识别同一对象
+- 确保每个订单对象只返回一次
+- 订单统计恢复准确
+
+【影响范围】
+仅影响 Lighter 交易所，其他交易所（Backpack、Hyperliquid）不受影响
 """
 
 import asyncio
@@ -134,19 +182,19 @@ class GridEngineImpl(IGridEngine):
         if reserve_manager:
             self.logger.info("✅ 健康检查器已配置现货预留管理")
 
-        # 🔥 启动订单健康检查
-        self._start_order_health_check()
+        # 🔥 注意：订单健康检查任务在 start() 中启动（确保 _running=True）
 
         self.logger.info(
             f"✅ 执行引擎初始化完成: {config.exchange}/{config.symbol}"
         )
 
-    async def place_order(self, order: GridOrder) -> GridOrder:
+    async def place_order(self, order: GridOrder, batch_mode: bool = False) -> GridOrder:
         """
         下单
 
         Args:
             order: 网格订单
+            batch_mode: 批量模式（仅限Lighter，避免频繁查询order_index）
 
         Returns:
             更新后的订单（包含交易所订单ID）
@@ -164,7 +212,8 @@ class GridEngineImpl(IGridEngine):
                 order_type=OrderType.LIMIT,  # 只使用限价单
                 amount=order.amount,
                 price=order.price,
-                params=None  # 暂时不传递任何额外参数，避免签名问题
+                params=None,  # 暂时不传递任何额外参数，避免签名问题
+                batch_mode=batch_mode  # 🔥 传递批量模式标志（仅Lighter使用）
             )
 
             # 更新订单ID
@@ -264,11 +313,12 @@ class GridEngineImpl(IGridEngine):
             exchange_id = str(self.config.exchange).lower(
             ) if self.config.exchange else ''
             if exchange_id == 'lighter':
-                self.logger.info("🔥 Lighter交易所：使用串行下单模式（避免nonce冲突）")
+                self.logger.info("🔥 Lighter交易所：使用串行批量下单模式（避免nonce冲突）")
                 results = []
                 for order in batch:
                     try:
-                        result = await self.place_order(order)
+                        # 🔥 批量下单时使用 batch_mode=True，不立即查询 order_index
+                        result = await self.place_order(order, batch_mode=True)
                         results.append(result)
                     except Exception as e:
                         results.append(e)
@@ -326,7 +376,8 @@ class GridEngineImpl(IGridEngine):
                     results = []
                     for order in retry_orders:
                         try:
-                            result = await self.place_order(order)
+                            # 🔥 重试也使用批量模式
+                            result = await self.place_order(order, batch_mode=True)
                             results.append(result)
                         except Exception as e:
                             results.append(e)
@@ -385,6 +436,40 @@ class GridEngineImpl(IGridEngine):
 
         return successful_orders
 
+    def _remove_order_from_pending(self, order_id: str) -> int:
+        """
+        从 _pending_orders 中移除订单（支持双键删除）
+
+        🔥 批量模式说明（2025-11）：
+        - 批量下单时，Lighter订单会暂时有两个键：client_id + order_index
+        - 需要找到并删除所有指向同一订单对象的键
+        - 使用对象ID (id(order)) 进行匹配
+
+        Args:
+            order_id: 订单ID（可能是 client_id 或 order_index）
+
+        Returns:
+            删除的键数量（0表示订单不存在，1-2表示删除的键数量）
+        """
+        if order_id not in self._pending_orders:
+            return 0
+
+        # 获取订单对象
+        order_obj = self._pending_orders[order_id]
+        order_obj_id = id(order_obj)
+
+        # 找到所有指向同一订单对象的键
+        keys_to_remove = [
+            key for key, order in self._pending_orders.items()
+            if id(order) == order_obj_id
+        ]
+
+        # 删除所有找到的键
+        for key in keys_to_remove:
+            del self._pending_orders[key]
+
+        return len(keys_to_remove)
+
     async def cancel_order(self, order_id: str) -> bool:
         """
         取消订单（主动取消，不会重新挂单）
@@ -402,11 +487,11 @@ class GridEngineImpl(IGridEngine):
 
             await self.exchange.cancel_order(order_id, self.config.symbol)
 
-            # 从追踪列表移除
+            # 标记为已取消并从追踪列表移除（自动处理 Lighter 双键）
             if order_id in self._pending_orders:
                 order = self._pending_orders[order_id]
                 order.mark_cancelled()
-                del self._pending_orders[order_id]
+                self._remove_order_from_pending(order_id)
 
             self.logger.info(f"✅ 主动取消订单成功: {order_id}")
             return True
@@ -535,10 +620,25 @@ class GridEngineImpl(IGridEngine):
         """
         获取当前所有挂单列表
 
+        🔥 批量模式说明（2025-11）：
+        - 批量下单时，订单会暂时有两个键：client_id + order_index
+        - 需要去重，避免统计重复
+        - 使用对象ID (id(order)) 进行去重
+
         Returns:
-            挂单列表
+            挂单列表（去重后）
         """
-        return list(self._pending_orders.values())
+        # 使用对象ID去重，避免同一订单被计数两次
+        seen_objects = set()
+        unique_orders = []
+
+        for order in self._pending_orders.values():
+            order_obj_id = id(order)
+            if order_obj_id not in seen_objects:
+                seen_objects.add(order_obj_id)
+                unique_orders.append(order)
+
+        return unique_orders
 
     def subscribe_order_updates(self, callback: Callable):
         """
@@ -657,7 +757,7 @@ class GridEngineImpl(IGridEngine):
                         self.logger.info(
                             f"📊 最后收到消息时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self._last_ws_message_time))}")
                         self.logger.info(
-                            f"📊 当前挂单数量: {len(self._pending_orders)}")
+                            f"📊 当前挂单数量: {len(self.get_pending_orders())}")
                         self._ws_monitoring_enabled = False
                         self._last_ws_check_time = current_time
                         continue
@@ -703,7 +803,7 @@ class GridEngineImpl(IGridEngine):
                                 self.logger.info(
                                     f"📊 最后消息时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self._last_ws_message_time))}")
                                 self.logger.info(
-                                    f"📊 当前挂单数量: {len(self._pending_orders)}")
+                                    f"📊 当前挂单数量: {len(self.get_pending_orders())}")
                                 self._ws_monitoring_enabled = False
                                 self._last_ws_check_time = current_time
                                 continue
@@ -856,18 +956,41 @@ class GridEngineImpl(IGridEngine):
                                 self.logger.error(traceback.format_exc())
                 else:
                     # 🔍 订单匹配成功（在挂单列表中）
-                    self.logger.debug(
-                        f"✅ 订单ID {order_id} 在挂单列表中（匹配成功）"
-                    )
+                    # 🔥 建立 order_index 映射（仅当 order_id 是 client_id 时）
+                    if order_id in open_client_ids:
+                        # 找到对应的 order_index
+                        for ex_order in open_orders:
+                            if ex_order.client_id == order_id:
+                                order_index = ex_order.id
+
+                                # 建立映射（如果还没有）
+                                if order_index and order_index not in self._pending_orders:
+                                    grid_order = self._pending_orders[order_id]
+                                    self._pending_orders[order_index] = grid_order
+
+                                    self.logger.info(
+                                        f"✅ 映射订单ID: client_id={order_id} → "
+                                        f"order_index={order_index} "
+                                        f"(Grid {grid_order.grid_id})"
+                                    )
+                                break
+                    else:
+                        self.logger.debug(
+                            f"✅ 订单ID {order_id} 在挂单列表中（匹配成功）"
+                        )
 
             if filled_count > 0:
+                # 使用 get_pending_orders() 获取去重后的订单数量
+                pending_count = len(self.get_pending_orders())
                 self.logger.info(
                     f"🎯 同步完成: 检测到 {filled_count} 个立即成交订单，"
-                    f"剩余挂单 {len(self._pending_orders)} 个"
+                    f"剩余挂单 {pending_count} 个"
                 )
             else:
+                # 使用 get_pending_orders() 获取去重后的订单数量
+                pending_count = len(self.get_pending_orders())
                 self.logger.info(
-                    f"✅ 同步完成: 所有 {len(self._pending_orders)} 个订单均在挂单列表中"
+                    f"✅ 同步完成: 所有 {pending_count} 个订单均在挂单列表中"
                 )
 
         except Exception as e:
@@ -1226,9 +1349,20 @@ class GridEngineImpl(IGridEngine):
         self._running = True
         self.logger.info("网格执行引擎已启动")
 
+        # 🔥 启动订单健康检查（在 _running=True 之后）
+        self._start_order_health_check()
+
     async def stop(self):
         """停止执行引擎"""
         self._running = False
+
+        # 🔥 取消健康检查任务
+        if self._health_check_task and not self._health_check_task.done():
+            self._health_check_task.cancel()
+            try:
+                await self._health_check_task
+            except asyncio.CancelledError:
+                self.logger.info("健康检查任务已取消")
 
         # 取消所有挂单
         await self.cancel_all_orders()
@@ -1330,9 +1464,19 @@ class GridEngineImpl(IGridEngine):
 
                 # 检查是否到达检查间隔
                 if time_since_last_check >= self.config.order_health_check_interval:
+                    self.logger.info(
+                        f"🔍 触发健康检查: 距上次检查={time_since_last_check:.0f}秒, "
+                        f"配置间隔={self.config.order_health_check_interval}秒"
+                    )
+
                     # 🆕 调用新的健康检查模块
                     if self._health_checker:
-                        await self._health_checker.perform_health_check()
+                        try:
+                            await self._health_checker.perform_health_check()
+                            self.logger.info("✅ 健康检查完成")
+                        except Exception as e:
+                            self.logger.error(
+                                f"❌ 健康检查执行失败: {e}", exc_info=True)
                     else:
                         self.logger.error("⚠️ 健康检查器未初始化")
 
@@ -1361,11 +1505,13 @@ class GridEngineImpl(IGridEngine):
         """
         try:
             # 统计当前订单状态（注意：GridOrderSide的值是小写 'buy' 和 'sell'）
-            buy_count = sum(1 for o in self._pending_orders.values()
+            # 🔥 使用 get_pending_orders() 获取去重后的订单列表
+            pending_orders = self.get_pending_orders()
+            buy_count = sum(1 for o in pending_orders
                             if o.side.value.lower() == 'buy')
-            sell_count = sum(1 for o in self._pending_orders.values()
+            sell_count = sum(1 for o in pending_orders
                              if o.side.value.lower() == 'sell')
-            total_count = len(self._pending_orders)
+            total_count = len(pending_orders)
 
             self.logger.info(
                 f"📊 健康检查后订单统计: "
@@ -1452,7 +1598,8 @@ class GridEngineImpl(IGridEngine):
                             f"⚠️ 同步订单{ex_order.id[:10]}...失败: {e}")
 
             # 3. 统计同步结果
-            total_local = len(self._pending_orders)
+            # 🔥 使用 get_pending_orders() 获取去重后的订单数量
+            total_local = len(self.get_pending_orders())
             total_exchange = len(exchange_orders)
 
             self.logger.info(

@@ -931,36 +931,63 @@ class LighterWebSocket(LighterBase):
                 logger.error(f"成交回调执行失败: {e}")
 
     def _trigger_order_callbacks(self, order: OrderData):
-        """触发订单回调（线程安全）"""
+        """触发订单回调（线程安全，带错误捕获）"""
         for callback in self._order_callbacks:
             try:
                 if asyncio.iscoroutinefunction(callback):
                     # 🔥 WebSocket在同步线程中运行，需要线程安全地调度协程
                     if self._event_loop and self._event_loop.is_running():
-                        asyncio.run_coroutine_threadsafe(
+                        future = asyncio.run_coroutine_threadsafe(
                             callback(order), self._event_loop)
+
+                        # 🔥 添加完成回调来捕获异常
+                        def log_error(fut):
+                            try:
+                                fut.result()  # 获取结果，如果有异常会抛出
+                            except Exception as e:
+                                logger.error(
+                                    f"❌ 订单回调执行出错: order_id={order.id}, "
+                                    f"side={order.side}, status={order.status}, "
+                                    f"error={e}",
+                                    exc_info=True
+                                )
+
+                        future.add_done_callback(log_error)
                     else:
-                        logger.debug("⚠️ 事件循环未运行，跳过订单回调")
+                        logger.warning("⚠️ 事件循环未运行，跳过订单回调")
                 else:
                     callback(order)
             except Exception as e:
-                logger.error(f"订单回调执行失败: {e}")
+                logger.error(f"订单回调执行失败: {e}", exc_info=True)
 
     def _trigger_order_fill_callbacks(self, order: OrderData):
-        """触发订单成交回调（线程安全）"""
+        """触发订单成交回调（线程安全，带错误捕获）"""
         for callback in self._order_fill_callbacks:
             try:
                 if asyncio.iscoroutinefunction(callback):
                     # 🔥 WebSocket在同步线程中运行，需要线程安全地调度协程
                     if self._event_loop and self._event_loop.is_running():
-                        asyncio.run_coroutine_threadsafe(
+                        future = asyncio.run_coroutine_threadsafe(
                             callback(order), self._event_loop)
+
+                        # 🔥 添加完成回调来捕获异常
+                        def log_error(fut):
+                            try:
+                                fut.result()
+                            except Exception as e:
+                                logger.error(
+                                    f"❌ 订单成交回调执行出错: order_id={order.id}, "
+                                    f"error={e}",
+                                    exc_info=True
+                                )
+
+                        future.add_done_callback(log_error)
                     else:
                         logger.warning("⚠️ 事件循环未运行，无法调度异步回调")
                 else:
                     callback(order)
             except Exception as e:
-                logger.error(f"订单成交回调执行失败: {e}")
+                logger.error(f"订单成交回调执行失败: {e}", exc_info=True)
 
     def _trigger_position_callbacks(self, position: PositionData):
         """触发持仓回调（线程安全）"""
@@ -1003,72 +1030,86 @@ class LighterWebSocket(LighterBase):
         logger.info("🚀 已启动直接订阅account_all_orders任务")
 
     async def _run_direct_ws_subscription(self):
-        """运行直接WebSocket订阅"""
-        try:
-            # 检查SignerClient是否可用
-            if not self.signer_client:
-                logger.error("❌ SignerClient未初始化，无法订阅订单")
-                return
+        """运行直接WebSocket订阅（永久运行，自动重连）"""
+        retry_count = 0
 
-            # 🔥 生成auth token（有效期1小时）
-            # create_auth_token_with_expiry需要过期时间戳（秒级），不是相对秒数
-            import time
-            expiry_timestamp = int(time.time()) + 3600  # 当前时间+1小时
+        # 🔥 外层循环：确保任务永不退出
+        while self.is_running:
+            try:
+                # 检查SignerClient是否可用
+                if not self.signer_client:
+                    logger.error("❌ SignerClient未初始化，无法订阅订单")
+                    await asyncio.sleep(10)
+                    continue
 
-            result = self.signer_client.create_auth_token_with_expiry(
-                expiry_timestamp)
-            # 返回的是元组 (token, None)
-            auth_token = result[0] if isinstance(result, tuple) else result
+                # 🔥 生成auth token（有效期1小时）
+                # create_auth_token_with_expiry需要过期时间戳（秒级），不是相对秒数
+                import time
+                expiry_timestamp = int(time.time()) + 3600  # 当前时间+1小时
 
-            logger.info(f"✅ 生成认证token (过期时间: {expiry_timestamp})")
+                result = self.signer_client.create_auth_token_with_expiry(
+                    expiry_timestamp)
+                # 返回的是元组 (token, None)
+                auth_token = result[0] if isinstance(result, tuple) else result
 
-            # 连接WebSocket
-            ws_url = self.ws_url
-            logger.info(f"🔗 连接WebSocket: {ws_url}")
+                logger.info(f"✅ 生成认证token (过期时间: {expiry_timestamp})")
 
-            # 🔥 配置WebSocket参数：设置合理的ping/pong间隔和超时
-            async with websockets.connect(
-                ws_url,
-                ping_interval=30,      # 每30秒发送一次ping（减少网络开销）
-                ping_timeout=30,       # 等待pong响应的超时时间为30秒
-                close_timeout=10       # 关闭连接的超时时间为10秒
-            ) as ws:
-                self._direct_ws = ws
+                # 连接WebSocket
+                ws_url = self.ws_url
+                logger.info(f"🔗 连接WebSocket: {ws_url}")
 
-                # 发送订阅消息
-                subscribe_msg = {
-                    "type": "subscribe",
-                    "channel": f"account_all_orders/{self.account_index}",
-                    "auth": auth_token
-                }
-                await ws.send(json.dumps(subscribe_msg))
-                logger.info(
-                    f"✅ 已订阅频道: account_all_orders/{self.account_index}")
+                # 🔥 修复1：移除ping/pong参数，允许Lighter长时间静默
+                # Lighter不会主动发送心跳，只在订单更新时推送消息
+                async with websockets.connect(
+                    ws_url,
+                    close_timeout=10       # 只保留关闭连接的超时时间
+                ) as ws:
+                    self._direct_ws = ws
 
-                # 持续接收消息
-                async for message in ws:
-                    try:
-                        data = json.loads(message)
-                        await self._handle_direct_ws_message(data)
-                    except json.JSONDecodeError as e:
-                        logger.error(f"❌ JSON解析失败: {e}")
-                    except Exception as e:
-                        logger.error(f"❌ 处理消息失败: {e}", exc_info=True)
+                    # 发送订阅消息
+                    subscribe_msg = {
+                        "type": "subscribe",
+                        "channel": f"account_all_orders/{self.account_index}",
+                        "auth": auth_token
+                    }
+                    await ws.send(json.dumps(subscribe_msg))
+                    logger.info(
+                        f"✅ 已订阅频道: account_all_orders/{self.account_index}")
 
-        except websockets.exceptions.ConnectionClosedError as e:
-            # WebSocket连接关闭（如心跳超时）
-            logger.warning(f"⚠️ WebSocket连接已关闭: {e}，5秒后重连...")
-            await asyncio.sleep(5)
-            # 自动重连
-            self._direct_ws_task = asyncio.create_task(
-                self._run_direct_ws_subscription())
-        except Exception as e:
-            logger.error(f"❌ 直接WebSocket订阅失败: {e}", exc_info=True)
-            # 10秒后重连（异常情况）
-            await asyncio.sleep(10)
-            if not self._direct_ws_task or self._direct_ws_task.done():
-                self._direct_ws_task = asyncio.create_task(
-                    self._run_direct_ws_subscription())
+                    # 重置重连计数（连接成功）
+                    retry_count = 0
+
+                    # 持续接收消息
+                    async for message in ws:
+                        try:
+                            data = json.loads(message)
+                            await self._handle_direct_ws_message(data)
+                        except json.JSONDecodeError as e:
+                            logger.error(f"❌ JSON解析失败: {e}")
+                        except Exception as e:
+                            logger.error(f"❌ 处理消息失败: {e}", exc_info=True)
+
+            except websockets.exceptions.ConnectionClosedError as e:
+                # WebSocket连接关闭
+                retry_count += 1
+                logger.warning(
+                    f"⚠️ WebSocket连接已关闭: {e}，5秒后重连 (第{retry_count}次)...")
+                await asyncio.sleep(5)
+                continue  # 外层循环会自动重连
+
+            except Exception as e:
+                # 🔥 修复2：捕获所有异常，确保任务不退出
+                retry_count += 1
+                retry_delay = min(retry_count * 5, 60)  # 指数退避，最多60秒
+                logger.error(
+                    f"❌ 直接WebSocket订阅失败 (第{retry_count}次): {e}，"
+                    f"{retry_delay}秒后重连...",
+                    exc_info=True
+                )
+                await asyncio.sleep(retry_delay)
+                # 外层循环会自动重连
+
+        logger.info("🛑 WebSocket订阅任务已停止")
 
     async def _handle_direct_ws_message(self, data: Dict[str, Any]):
         """

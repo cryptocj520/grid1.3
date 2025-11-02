@@ -531,18 +531,28 @@ class OrderHealthChecker:
             self.logger.debug(
                 f"使用市价单平仓: {order_side.value} {amount} (参考价格: {current_price})")
 
-            # 调用交易所接口平仓（市价单）
-            # 注意：
-            # - Backpack: 不支持 reduceOnly，price=None即可
-            # - Hyperliquid: 市价单需要price来计算滑点（默认5%）
-            order = await self.engine.exchange.create_order(
-                symbol=self.config.symbol,
-                side=order_side,
-                order_type=OrderType.MARKET,  # 使用市价单
-                amount=amount,
-                price=current_price  # Hyperliquid需要价格计算滑点，Backpack会忽略
-                # 不传递 params，避免 Backpack API 签名错误
-            )
+            # 🔥 多交易所兼容处理
+            # Lighter: 必须使用 place_market_order + reduce_only=True
+            # 其他交易所: 使用 create_order
+            if hasattr(self.engine.exchange, 'place_market_order'):
+                # Lighter 交易所：使用专用方法确保正确平仓
+                self.logger.debug("使用 Lighter 专用平仓方法（reduce_only=True）")
+                order = await self.engine.exchange.place_market_order(
+                    symbol=self.config.symbol,
+                    side=order_side,
+                    quantity=amount,
+                    reduce_only=True  # 🔥 Lighter必需：只减仓模式
+                )
+            else:
+                # Backpack/Hyperliquid: 使用通用方法
+                self.logger.debug("使用通用平仓方法（create_order）")
+                order = await self.engine.exchange.create_order(
+                    symbol=self.config.symbol,
+                    side=order_side,
+                    order_type=OrderType.MARKET,
+                    amount=amount,
+                    price=current_price  # Hyperliquid需要价格计算滑点
+                )
 
             self.logger.debug(
                 f"✅ 平仓市价单已提交: {order_side.value} {amount}, OrderID={order.id}")
@@ -571,18 +581,29 @@ class OrderHealthChecker:
             self.logger.debug(
                 f"使用市价单开仓: {order_side.value} {amount} (参考价格: {current_price})")
 
-            # 调用交易所接口开仓（市价单）
-            # 注意：
-            # - Backpack: price=None即可
-            # - Hyperliquid: 市价单需要price来计算滑点（默认5%）
-            order = await self.engine.exchange.create_order(
-                symbol=self.config.symbol,
-                side=order_side,
-                order_type=OrderType.MARKET,  # 使用市价单
-                amount=amount,
-                price=current_price,  # Hyperliquid需要价格计算滑点，Backpack会忽略
-                params={}
-            )
+            # 🔥 多交易所兼容处理
+            # Lighter: 使用 place_market_order + reduce_only=False
+            # 其他交易所: 使用 create_order
+            if hasattr(self.engine.exchange, 'place_market_order'):
+                # Lighter 交易所：使用专用方法
+                self.logger.debug("使用 Lighter 专用开仓方法（reduce_only=False）")
+                order = await self.engine.exchange.place_market_order(
+                    symbol=self.config.symbol,
+                    side=order_side,
+                    quantity=amount,
+                    reduce_only=False  # 🔥 Lighter：允许开仓
+                )
+            else:
+                # Backpack/Hyperliquid: 使用通用方法
+                self.logger.debug("使用通用开仓方法（create_order）")
+                order = await self.engine.exchange.create_order(
+                    symbol=self.config.symbol,
+                    side=order_side,
+                    order_type=OrderType.MARKET,
+                    amount=amount,
+                    price=current_price,  # Hyperliquid需要价格计算滑点
+                    params={}
+                )
 
             self.logger.debug(
                 f"✅ 开仓市价单已提交: {order_side.value} {amount}, OrderID={order.id}")

@@ -86,11 +86,19 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
         # 🔥 最新订单簿数据（用于UI显示）
         self._latest_orderbook: Optional['OrderBookData'] = None
 
-        # 🔥 WebSocket订单成交监控
-        self._order_fill_events: Dict[str,
-                                      asyncio.Event] = {}  # {tx_hash: Event}
-        # {tx_hash: OrderData}
-        self._order_fill_data: Dict[str, OrderData] = {}
+        # 🔥 最新余额数据（用于UI显示）
+        self._latest_balance: Optional[Decimal] = None
+        self._balance_currency: str = "USDC"  # 余额币种
+
+        # 🔥 WebSocket订单成交监控（基于状态机，不依赖order_id）
+        # 状态机：IDLE -> WAITING_OPEN -> POSITION_OPEN -> WAITING_CLOSE -> IDLE
+        self._fill_state = "IDLE"  # IDLE, WAITING_OPEN, WAITING_CLOSE
+        self._expected_side: Optional[str] = None  # "buy" or "sell"
+        self._expected_amount: Optional[Decimal] = None
+        self._accumulated_amount: Decimal = Decimal("0")
+        self._accumulated_cost: Decimal = Decimal("0")  # 用于计算平均价格
+        self._fill_event: Optional[asyncio.Event] = None
+        self._fill_lock = asyncio.Lock()  # 保护状态变更
 
     async def initialize(self, config: VolumeMakerConfig) -> bool:
         """初始化刷量服务"""
@@ -177,57 +185,126 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
         """
         订单成交回调（由WebSocket触发）
 
+        🔥 新逻辑：基于状态机匹配，不依赖order_id
+        - 只关注方向和数量是否匹配当前状态
+        - 累加成交直到满足期望数量
+        - 计算平均成交价格
+
         Args:
             order: 成交的订单数据
         """
         try:
-            tx_hash = order.id if hasattr(order, 'id') else order.order_id
+            async with self._fill_lock:
+                # 如果不在等待状态，忽略
+                if self._fill_state not in ["WAITING_OPEN", "WAITING_CLOSE"]:
+                    return
 
-            # 缓存订单成交数据
-            self._order_fill_data[tx_hash] = order
+                # 检查方向是否匹配
+                order_side = order.side.value.lower()  # "buy" or "sell"
+                if order_side != self._expected_side:
+                    return
 
-            # 触发事件（如果有等待者）
-            if tx_hash in self._order_fill_events:
-                self._order_fill_events[tx_hash].set()
+                # 累加成交数量和成本
+                fill_amount = order.filled if order.filled else order.amount
+                fill_price = order.average if order.average else order.price
+
+                self._accumulated_amount += fill_amount
+                self._accumulated_cost += fill_amount * fill_price
+
+                self.logger.info(
+                    f"📨 WebSocket收到成交 - "
+                    f"方向: {order_side}, "
+                    f"数量: {fill_amount}, "
+                    f"价格: {fill_price}, "
+                    f"累计: {self._accumulated_amount}/{self._expected_amount}"
+                )
+
+                # 检查是否已满足期望数量
+                if self._accumulated_amount >= self._expected_amount:
+                    # 计算平均价格
+                    avg_price = self._accumulated_cost / self._accumulated_amount
+                    self.logger.info(
+                        f"✅ 成交完成 - "
+                        f"总数量: {self._accumulated_amount}, "
+                        f"平均价格: {avg_price:.2f}"
+                    )
+
+                    # 触发等待事件
+                    if self._fill_event:
+                        self._fill_event.set()
 
         except Exception as e:
             self.logger.error(f"❌ 处理订单成交回调失败: {e}", exc_info=True)
 
-    async def _wait_for_order_fill(self, tx_hash: str, timeout: float = 10.0) -> Optional[OrderData]:
+    def _prepare_fill_tracking(self, side: str, amount: Decimal, state: str):
+        """
+        准备成交追踪（设置状态机）
+
+        Args:
+            side: 订单方向 "buy" or "sell"
+            amount: 期望成交数量
+            state: 目标状态 "WAITING_OPEN" or "WAITING_CLOSE"
+        """
+        self._fill_state = state
+        self._expected_side = side.lower()
+        self._expected_amount = amount
+        self._accumulated_amount = Decimal("0")
+        self._accumulated_cost = Decimal("0")
+        self._fill_event = asyncio.Event()
+
+        self.logger.debug(
+            f"🎯 准备追踪成交 - 状态: {state}, 方向: {side}, 数量: {amount}"
+        )
+
+    async def _wait_for_order_fill(self, side: str, amount: Decimal, timeout: float = 10.0) -> Optional[Dict[str, Any]]:
         """
         等待订单成交（通过WebSocket推送）
 
+        🔥 新逻辑：基于状态机等待，不依赖order_id
+        - 通过方向和数量匹配成交
+        - 支持部分成交累加
+        - 返回平均成交价格
+
         Args:
-            tx_hash: 订单交易哈希
+            side: 订单方向 "buy" or "sell"
+            amount: 期望成交数量
             timeout: 超时时间（秒）
 
         Returns:
-            OrderData: 成交的订单数据，或None（超时/失败）
+            Dict: {"average_price": Decimal, "filled_amount": Decimal} 或 None（超时）
         """
         try:
-            # 检查是否已经在缓存中
-            if tx_hash in self._order_fill_data:
-                return self._order_fill_data[tx_hash]
-
-            # 创建事件并等待
-            self._order_fill_events[tx_hash] = asyncio.Event()
+            if not self._fill_event:
+                self.logger.error("❌ 未准备成交追踪，请先调用 _prepare_fill_tracking")
+                return None
 
             try:
-                await asyncio.wait_for(self._order_fill_events[tx_hash].wait(), timeout=timeout)
+                await asyncio.wait_for(self._fill_event.wait(), timeout=timeout)
+
                 # 成功收到成交通知
-                fill_data = self._order_fill_data.get(tx_hash)
-                return fill_data
+                avg_price = self._accumulated_cost / self._accumulated_amount
+
+                return {
+                    "average_price": avg_price,
+                    "filled_amount": self._accumulated_amount
+                }
+
             except asyncio.TimeoutError:
-                self.logger.warning(f"⏰ 订单成交超时: {tx_hash[:16]}...")
+                self.logger.warning(
+                    f"⏰ 订单成交超时 - "
+                    f"方向: {side}, "
+                    f"期望: {amount}, "
+                    f"已收到: {self._accumulated_amount}"
+                )
                 return None
-            finally:
-                # 清理事件
-                if tx_hash in self._order_fill_events:
-                    del self._order_fill_events[tx_hash]
 
         except Exception as e:
             self.logger.error(f"❌ 等待订单成交失败: {e}", exc_info=True)
             return None
+        finally:
+            # 重置状态
+            self._fill_state = "IDLE"
+            self._fill_event = None
 
     def _setup_logging(self):
         """设置日志"""
@@ -408,7 +485,8 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
                         symbol=self.config.symbol,
                         side=side,
                         quantity=abs(pos.size),
-                        reduce_only=True  # 🔥 只减仓模式：紧急平仓时避免误操作
+                        reduce_only=True,  # 🔥 只减仓模式：紧急平仓时避免误操作
+                        skip_order_index_query=True  # 🔥 跳过 order_index 查询
                     )
                     self.logger.info("✅ 紧急平仓完成")
         except Exception as e:
@@ -437,23 +515,47 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
                     # 🔥 确定平仓方向（与持仓方向相反）
                     # 必须使用 side 字段，因为 size 是绝对值
                     side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
+                    close_direction = "sell" if side == OrderSide.SELL else "buy"
+                    close_quantity = abs(pos.size)
 
                     position_side_str = "多头" if pos.side == PositionSide.LONG else "空头"
                     close_side_str = "卖出" if side == OrderSide.SELL else "买入"
                     self.logger.info(
-                        f"📊 清理持仓 - 持仓方向: {position_side_str}, 平仓方向: {close_side_str}, 数量: {pos.size}")
+                        f"📊 清理持仓 - 持仓方向: {position_side_str}, 平仓方向: {close_side_str}, 数量: {close_quantity}")
+
+                    # 🔥 准备成交追踪（在下单前设置状态机）
+                    self._prepare_fill_tracking(
+                        side=close_direction,
+                        amount=close_quantity,
+                        state="WAITING_CLOSE"
+                    )
 
                     # 🔥 清理操作也添加超时
-                    await asyncio.wait_for(
+                    order = await asyncio.wait_for(
                         self.execution_adapter.place_market_order(
                             symbol=self.config.symbol,
                             side=side,
-                            quantity=abs(pos.size),
-                            reduce_only=True  # 🔥 只减仓模式：避免误开新仓
+                            quantity=close_quantity,
+                            reduce_only=True,  # 🔥 只减仓模式：避免误开新仓
+                            skip_order_index_query=True  # 🔥 跳过 order_index 查询
                         ),
                         timeout=10.0  # 10秒超时
                     )
-                    self.logger.info("✅ 持仓清理完成")
+
+                    if order:
+                        # 等待 WebSocket 成交通知
+                        fill_result = await self._wait_for_order_fill(
+                            side=close_direction,
+                            amount=close_quantity,
+                            timeout=10.0
+                        )
+                        if fill_result:
+                            self.logger.info(
+                                f"✅ 持仓清理完成 - "
+                                f"平均价格: {fill_result['average_price']:.2f}, "
+                                f"成交数量: {fill_result['filled_amount']}")
+                        else:
+                            self.logger.info("✅ 持仓清理完成（未收到成交确认）")
 
         except asyncio.TimeoutError:
             self.logger.warning("⏰ 检查/清理持仓超时，跳过")
@@ -707,9 +809,10 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
 
         # 🔥 等待链上确认，避免频繁查询触发API限流
         # 使用基础延迟，不使用指数退避（这是正常流程）
-        base_wait = 30  # 🔥 调整为30秒，避免API限流
-        self.logger.info(f"⏰ 等待{base_wait}秒让链上确认平仓交易...")
-        await asyncio.sleep(base_wait)
+        # 等待时间由配置文件指定，默认30秒
+        wait_time = self.config.chain_confirmation_wait
+        self.logger.info(f"⏰ 等待{wait_time}秒让链上确认平仓交易...")
+        await asyncio.sleep(wait_time)
 
         # 验证持仓清空
         self.logger.info("🔍 验证Lighter持仓...")
@@ -762,18 +865,23 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
             for bal in balance:
                 if bal.currency.upper() in ['USDC', 'USD', 'USDT']:
                     usdc_balance = bal.free
+                    self._balance_currency = bal.currency.upper()  # 🔥 更新币种
                     break
 
             if usdc_balance is None:
                 self.logger.warning("⚠️ 未找到USDC余额")
                 return True  # 继续运行
 
+            # 🔥 更新最新余额（用于UI显示）
+            self._latest_balance = usdc_balance
+
             if self.config.min_balance is not None and usdc_balance < Decimal(str(self.config.min_balance)):
                 self.logger.error(
                     f"❌ Lighter余额不足 - 当前: {usdc_balance}, 要求: {self.config.min_balance}")
                 return False
 
-            self.logger.info(f"✅ Lighter余额检查通过 - USDC: {usdc_balance}")
+            self.logger.info(
+                f"✅ Lighter余额检查通过 - {self._balance_currency}: {usdc_balance}")
             return True
 
         except Exception as e:
@@ -1075,12 +1183,21 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
         try:
             side = OrderSide.BUY if direction == "buy" else OrderSide.SELL
 
+            # 🔥 准备成交追踪（在下单前设置状态机）
+            self._prepare_fill_tracking(
+                side=direction,  # "buy" or "sell"
+                amount=self.config.order_size,
+                state="WAITING_OPEN"
+            )
+
             # 🔥 使用execution_symbol
             execution_symbol = self.config.execution_symbol or self.config.symbol
             order = await self.execution_adapter.place_market_order(
                 symbol=execution_symbol,
                 side=side,
-                quantity=self.config.order_size
+                quantity=self.config.order_size,
+                reduce_only=False,  # 🔥 开仓模式：允许建仓和加仓（与网格交易程序一致）
+                skip_order_index_query=True  # 🔥 跳过 order_index 查询（使用状态机匹配）
             )
 
             # 🔥 市价单特性：立即提交但返回时状态是PENDING
@@ -1089,11 +1206,16 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
                 self.logger.info(f"✅ Lighter市价开仓提交成功: tx={order.id[:16]}...")
 
                 # 🔥 等待WebSocket推送订单成交信息（获取真实成交价）
-                fill_order = await self._wait_for_order_fill(order.id, timeout=10)
-                if fill_order and fill_order.average and fill_order.average > 0:
+                # 超时时间由配置文件指定（默认15秒）：Lighter是链上交易所，确认时间较长
+                fill_result = await self._wait_for_order_fill(
+                    side=direction,
+                    amount=self.config.order_size,
+                    timeout=self.config.websocket_fill_timeout
+                )
+                if fill_result:
                     # 使用WebSocket获取的真实成交价
-                    order.average = fill_order.average
-                    order.filled = fill_order.filled
+                    order.average = fill_result["average_price"]
+                    order.filled = fill_result["filled_amount"]
                     self.logger.info(
                         f"✅ 从WebSocket获取开仓价: {order.average}, 成交量: {order.filled}")
                 else:
@@ -1136,6 +1258,14 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
         try:
             # 平仓方向与开仓相反
             close_side = OrderSide.SELL if direction == "buy" else OrderSide.BUY
+            close_direction = "sell" if direction == "buy" else "buy"
+
+            # 🔥 准备成交追踪（在下单前设置状态机）
+            self._prepare_fill_tracking(
+                side=close_direction,  # 平仓方向（与开仓相反）
+                amount=self.config.order_size,
+                state="WAITING_CLOSE"
+            )
 
             # 🔥 使用execution_symbol
             execution_symbol = self.config.execution_symbol or self.config.symbol
@@ -1143,7 +1273,8 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
                 symbol=execution_symbol,
                 side=close_side,
                 quantity=self.config.order_size,
-                reduce_only=True  # 🔥 只减仓模式：不会开新仓或加仓
+                reduce_only=True,  # 🔥 只减仓模式：不会开新仓或加仓
+                skip_order_index_query=True  # 🔥 跳过 order_index 查询（使用状态机匹配）
             )
 
             # 🔥 市价单特性：立即提交但返回时状态是PENDING
@@ -1152,11 +1283,16 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
                 self.logger.info(f"✅ Lighter市价平仓提交成功: tx={order.id[:16]}...")
 
                 # 🔥 等待WebSocket推送订单成交信息（获取真实成交价）
-                fill_order = await self._wait_for_order_fill(order.id, timeout=10)
-                if fill_order and fill_order.average and fill_order.average > 0:
+                # 超时时间由配置文件指定（默认15秒）：Lighter是链上交易所，确认时间较长
+                fill_result = await self._wait_for_order_fill(
+                    side=close_direction,
+                    amount=self.config.order_size,
+                    timeout=self.config.websocket_fill_timeout
+                )
+                if fill_result:
                     # 使用WebSocket获取的真实成交价
-                    close_price = fill_order.average
-                    close_amount = fill_order.filled
+                    close_price = fill_result["average_price"]
+                    close_amount = fill_result["filled_amount"]
                     self.logger.info(
                         f"✅ 从WebSocket获取平仓价: {close_price}, 成交量: {close_amount}")
                 else:
@@ -1292,8 +1428,16 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
                         # 记录持仓方向和平仓方向
                         position_side_str = "多头" if current_position.side == PositionSide.LONG else "空头"
                         close_side_str = "卖出" if close_side == OrderSide.SELL else "买入"
+                        close_direction = "sell" if close_side == OrderSide.SELL else "buy"
                         self.logger.info(
                             f"📊 最新持仓方向: {position_side_str}, 数量: {close_quantity}, 平仓方向: {close_side_str}")
+
+                        # 🔥 准备成交追踪（在下单前设置状态机）
+                        self._prepare_fill_tracking(
+                            side=close_direction,
+                            amount=Decimal(str(close_quantity)),
+                            state="WAITING_CLOSE"
+                        )
 
                         # 执行平仓
                         execution_symbol = self.config.execution_symbol or self.config.symbol
@@ -1309,7 +1453,8 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
                             symbol=execution_symbol,
                             side=close_side,
                             quantity=Decimal(str(close_quantity)),
-                            reduce_only=True  # 🔥 只减仓模式：避免越平越多
+                            reduce_only=True,  # 🔥 只减仓模式：避免越平越多
+                            skip_order_index_query=True  # 🔥 跳过 order_index 查询
                         )
 
                         if order and order.id:
@@ -1318,6 +1463,21 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
                                 f"方向={close_side}, "
                                 f"请求数量={close_quantity}, "
                                 f"成交数量={order.filled if order.filled else 'N/A'}")
+
+                            # 🔥 等待 WebSocket 成交通知（获取真实成交价）
+                            fill_result = await self._wait_for_order_fill(
+                                side=close_direction,
+                                amount=Decimal(str(close_quantity)),
+                                timeout=10.0  # 自动平仓使用较短超时
+                            )
+                            if fill_result:
+                                self.logger.info(
+                                    f"✅ 自动平仓成交确认 - "
+                                    f"平均价格: {fill_result['average_price']:.2f}, "
+                                    f"成交数量: {fill_result['filled_amount']}")
+                            else:
+                                self.logger.warning(
+                                    "⚠️ 未收到自动平仓成交通知（将通过持仓验证确认）")
 
                             # 🔥 指数退避延迟：避免API限流
                             # 公式: min(base * 2^(attempt - 1), max_delay)

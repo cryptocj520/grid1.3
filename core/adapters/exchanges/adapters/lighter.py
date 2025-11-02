@@ -290,8 +290,7 @@ class LighterAdapter(ExchangeAdapter):
             if exchange_info and exchange_info.symbols:
                 self._supported_symbols = [s['symbol']
                                            for s in exchange_info.symbols]
-                self._market_info = {s['symbol']
-                    : s for s in exchange_info.symbols}
+                self._market_info = {s['symbol']                                     : s for s in exchange_info.symbols}
 
                 # 更新base模块的市场缓存
                 self._base.update_markets_cache(exchange_info.symbols)
@@ -539,7 +538,8 @@ class LighterAdapter(ExchangeAdapter):
         order_type: OrderType,
         amount: Decimal,
         price: Optional[Decimal] = None,
-        params: Optional[Dict[str, Any]] = None
+        params: Optional[Dict[str, Any]] = None,
+        batch_mode: bool = False
     ) -> OrderData:
         """
         创建订单（ExchangeInterface标准方法）
@@ -551,6 +551,7 @@ class LighterAdapter(ExchangeAdapter):
             amount: 数量
             price: 价格（限价单必需）
             params: 额外参数
+            batch_mode: 批量模式（避免频繁查询order_index）
 
         Returns:
             OrderData对象
@@ -561,9 +562,10 @@ class LighterAdapter(ExchangeAdapter):
         side_str = side.value.lower()  # "buy" 或 "sell"
         order_type_str = order_type.value.lower()  # "limit" 或 "market"
 
-        # 调用内部的place_order方法
+        # 调用内部的place_order方法，传递 batch_mode
         return await self._rest.place_order(
-            normalized_symbol, side_str, order_type_str, amount, price, **(params or {})
+            normalized_symbol, side_str, order_type_str, amount, price,
+            batch_mode=batch_mode, **(params or {})
         )
 
     async def place_order(
@@ -592,6 +594,32 @@ class LighterAdapter(ExchangeAdapter):
         normalized_symbol = self._normalize_symbol(symbol)
         return await self._rest.place_order(
             normalized_symbol, side, order_type, quantity, price, **kwargs
+        )
+
+    async def place_market_order(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: Decimal,
+        reduce_only: bool = False,
+        skip_order_index_query: bool = False
+    ) -> Optional[OrderData]:
+        """
+        下市价单（便捷方法）
+
+        Args:
+            symbol: 交易对符号
+            side: 订单方向
+            quantity: 数量
+            reduce_only: 只减仓模式（平仓专用，不会开新仓或加仓）
+            skip_order_index_query: 跳过 order_index 查询（Volume Maker 使用）
+
+        Returns:
+            订单数据 或 None
+        """
+        normalized_symbol = self._normalize_symbol(symbol)
+        return await self._rest.place_market_order(
+            normalized_symbol, side, quantity, reduce_only, skip_order_index_query
         )
 
     async def get_order(self, order_id: str, symbol: str) -> OrderData:
