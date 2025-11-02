@@ -54,9 +54,10 @@ class LighterWebSocket(LighterBase):
         self.ws_client: Optional[WsClient] = None
         self._ws_task: Optional[asyncio.Task] = None
 
-        # 直接WebSocket连接（用于订阅account_all_orders）
+        # 直接WebSocket连接（用于订阅account_all_orders和market_stats）
         self._direct_ws = None
         self._direct_ws_task: Optional[asyncio.Task] = None
+        self._subscribed_market_stats: List[int] = []  # 订阅的market_stats市场
 
         # 保存事件循环引用
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -209,7 +210,7 @@ class LighterWebSocket(LighterBase):
 
     async def subscribe_ticker(self, symbol: str, callback: Optional[Callable] = None):
         """
-        订阅ticker数据
+        订阅ticker数据（使用market_stats频道）
 
         Args:
             symbol: 交易对符号
@@ -223,7 +224,8 @@ class LighterWebSocket(LighterBase):
         if callback:
             self._ticker_callbacks.append(callback)
 
-        await self.subscribe_orderbook(market_index, symbol)
+        # 🔥 使用market_stats代替orderbook
+        await self.subscribe_market_stats(market_index, symbol)
 
     async def subscribe_orderbook(self, market_index_or_symbol, symbol: Optional[str] = None):
         """
@@ -250,6 +252,65 @@ class LighterWebSocket(LighterBase):
 
             # 如果WsClient已创建，需要重新创建以包含新的订阅
             await self._recreate_ws_client()
+
+    async def subscribe_market_stats(self, market_index_or_symbol, symbol: Optional[str] = None):
+        """
+        订阅市场统计数据（market_stats频道，用于获取价格）
+
+        Args:
+            market_index_or_symbol: 市场索引或交易对符号
+            symbol: 交易对符号（如果第一个参数是市场索引）
+        """
+        if isinstance(market_index_or_symbol, str):
+            symbol = market_index_or_symbol
+            market_index = self.get_market_index(symbol)
+            if market_index is None:
+                logger.warning(f"未找到交易对 {symbol} 的市场索引")
+                return
+        else:
+            market_index = market_index_or_symbol
+            if symbol is None:
+                symbol = self._get_symbol_from_market_index(market_index)
+
+        if market_index not in self._subscribed_market_stats:
+            self._subscribed_market_stats.append(market_index)
+            logger.info(
+                f"🔔 已订阅market_stats: {symbol} (market_index={market_index})")
+
+            # 启动直接WebSocket订阅（如果尚未启动）
+            await self._ensure_direct_ws_running()
+
+    async def _ensure_direct_ws_running(self):
+        """确保直接WebSocket订阅任务正在运行"""
+        if not WEBSOCKETS_AVAILABLE:
+            logger.warning("⚠️ websockets库未安装，无法直接订阅market_stats")
+            return
+
+        if self._direct_ws_task and not self._direct_ws_task.done():
+            # 任务已在运行，发送新的订阅消息
+            if self._direct_ws:
+                await self._send_market_stats_subscriptions()
+        else:
+            # 启动新任务
+            self._direct_ws_task = asyncio.create_task(
+                self._run_direct_ws_subscription())
+            logger.info("🚀 已启动直接订阅WebSocket任务（market_stats）")
+
+    async def _send_market_stats_subscriptions(self):
+        """发送market_stats订阅消息"""
+        if not self._direct_ws:
+            return
+
+        for market_index in self._subscribed_market_stats:
+            subscribe_msg = {
+                "type": "subscribe",
+                "channel": f"market_stats/{market_index}"
+            }
+            try:
+                await self._direct_ws.send(json.dumps(subscribe_msg))
+                logger.info(f"📤 发送market_stats订阅: market_index={market_index}")
+            except Exception as e:
+                logger.error(f"发送market_stats订阅失败: {e}")
 
     async def subscribe_trades(self, symbol: str, callback: Optional[Callable] = None):
         """
@@ -1067,14 +1128,19 @@ class LighterWebSocket(LighterBase):
                     self._direct_ws = ws
 
                     # 发送订阅消息
-                    subscribe_msg = {
-                        "type": "subscribe",
-                        "channel": f"account_all_orders/{self.account_index}",
-                        "auth": auth_token
-                    }
-                    await ws.send(json.dumps(subscribe_msg))
-                    logger.info(
-                        f"✅ 已订阅频道: account_all_orders/{self.account_index}")
+                    # 1️⃣ 订阅account_all_orders（需要认证）
+                    if self.account_index:
+                        subscribe_msg = {
+                            "type": "subscribe",
+                            "channel": f"account_all_orders/{self.account_index}",
+                            "auth": auth_token
+                        }
+                        await ws.send(json.dumps(subscribe_msg))
+                        logger.info(
+                            f"✅ 已订阅频道: account_all_orders/{self.account_index}")
+
+                    # 2️⃣ 订阅market_stats（无需认证）
+                    await self._send_market_stats_subscriptions()
 
                     # 重置重连计数（连接成功）
                     retry_count = 0
@@ -1166,8 +1232,74 @@ class LighterWebSocket(LighterBase):
                                             else:
                                                 callback(order)
 
+            # 🔥 处理market_stats更新
+            elif msg_type in ("subscribed/market_stats", "update/market_stats") and "market_stats" in data:
+                await self._handle_market_stats_update(data["market_stats"])
+
         except Exception as e:
             logger.error(f"❌ 处理直接WebSocket消息失败: {e}", exc_info=True)
+
+    async def _handle_market_stats_update(self, market_stats: Dict[str, Any]):
+        """
+        处理market_stats更新
+
+        market_stats格式:
+        {
+            "market_id": 1,
+            "index_price": "110687.2",
+            "mark_price": "110660.1",
+            "last_trade_price": "110657.5",
+            "open_interest": "308919704.542476",
+            "current_funding_rate": "0.0012",
+            ...
+        }
+        """
+        try:
+            market_id = market_stats.get("market_id")
+            if market_id is None:
+                return
+
+            symbol = self._get_symbol_from_market_index(market_id)
+            if not symbol:
+                return
+
+            # 🔥 提取价格数据
+            last_price = self._safe_decimal(
+                market_stats.get("last_trade_price", 0))
+            if not last_price:
+                return
+
+            # 构造TickerData（使用正确的字段名）
+            ticker = TickerData(
+                symbol=symbol,
+                timestamp=datetime.now(),  # ✅ 必需字段，使用datetime对象
+                last=last_price,  # ✅ 最新成交价
+                bid=self._safe_decimal(market_stats.get(
+                    "mark_price", last_price)),  # 使用mark_price作为bid近似值
+                ask=self._safe_decimal(market_stats.get(
+                    "index_price", last_price)),  # 使用index_price作为ask近似值
+                volume=self._safe_decimal(
+                    market_stats.get("daily_base_token_volume", 0)),  # 24小时成交量
+                high=self._safe_decimal(
+                    market_stats.get("daily_price_high", 0)),  # 24小时最高价
+                low=self._safe_decimal(
+                    market_stats.get("daily_price_low", 0)),  # 24小时最低价
+                funding_rate=self._safe_decimal(
+                    market_stats.get("current_funding_rate", 0))  # 资金费率
+            )
+
+            logger.debug(f"📊 market_stats更新: {symbol}, 价格={last_price}")
+
+            # 触发ticker回调
+            if self._ticker_callbacks:
+                for callback in self._ticker_callbacks:
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(ticker)
+                    else:
+                        callback(ticker)
+
+        except Exception as e:
+            logger.error(f"❌ 处理market_stats更新失败: {e}", exc_info=True)
 
     def _parse_order_from_direct_ws(self, order_info: Dict[str, Any]) -> Optional[OrderData]:
         """
